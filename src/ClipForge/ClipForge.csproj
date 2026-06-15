@@ -10,6 +10,7 @@
     <AssemblyName>ClipForge</AssemblyName>
     <RootNamespace>ClipForge</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>app.ico</ApplicationIcon>
     <Version>1.0.0</Version>
     <Company>ClipForge</Company>
     <Product>ClipForge</Product>
@@ -18,6 +19,11 @@
   <ItemGroup>
     <PackageReference Include="System.Text.Json" Version="8.0.5" />
     <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Embedded so windows can use it as their Icon (also set as the exe icon above). -->
+    <Resource Include="app.ico" />
   </ItemGroup>
 
 </Project>

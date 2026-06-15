@@ -5,6 +5,7 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         mc:Ignorable="d"
         Title="ClipForge"
+        Icon="app.ico"
         Width="460"
         Height="560"
         MinWidth="420"
@@ -122,7 +123,7 @@
 
         <!-- Header -->
         <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,18">
-            <Ellipse Width="14" Height="14" Fill="{DynamicResource AccentBrush}" VerticalAlignment="Center" />
+            <Image Source="app.ico" Width="30" Height="30" VerticalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality" />
             <TextBlock Text="ClipForge"
                        FontSize="22"
                        FontWeight="Bold"

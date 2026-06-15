@@ -3,6 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:sys="clr-namespace:System;assembly=mscorlib"
         Title="ClipForge — Settings"
+        Icon="/app.ico"
         Width="640" Height="620"
         MinWidth="560" MinHeight="520"
         WindowStartupLocation="CenterOwner"
@@ -270,12 +271,11 @@
                                 Margin="8,6,0,6"
                                 Command="{Binding RefreshDevicesCommand}"/>
 
-                        <TextBlock Grid.Row="2" Grid.Column="0" Style="{StaticResource LabelText}" Text="System device"/>
-                        <ComboBox Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2"
-                                  IsEditable="True"
-                                  ItemsSource="{Binding AudioDevices}"
-                                  Text="{Binding SystemAudioDevice}"
-                                  IsEnabled="{Binding UsesSystemAudio}"/>
+                        <TextBlock Grid.Row="2" Grid.Column="0" Style="{StaticResource LabelText}" Text="System audio"/>
+                        <TextBlock Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2"
+                                   Foreground="{StaticResource SubtleTextBrush}"
+                                   TextWrapping="Wrap" VerticalAlignment="Center" Margin="0,6"
+                                   Text="Captured automatically via WASAPI loopback (no device selection needed)."/>
 
                         <TextBlock Grid.Row="3" Grid.Column="0" Style="{StaticResource LabelText}" Text="Microphone"/>
                         <ComboBox Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="2"

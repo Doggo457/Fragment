@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#222838"/>
+      <stop offset="1" stop-color="#0E1014"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#33d6ff"/>
+      <stop offset="1" stop-color="#0090cc"/>
+    </linearGradient>
+  </defs>
+
+  <!-- rounded-square tile (transparent corners) -->
+  <rect x="8" y="8" width="240" height="240" rx="58" fill="url(#bg)" stroke="#323a48" stroke-width="2"/>
+
+  <!-- record ring -->
+  <circle cx="128" cy="128" r="72" fill="none" stroke="url(#accent)" stroke-width="17"/>
+
+  <!-- play / clip wedge inside the record dot -->
+  <circle cx="128" cy="128" r="40" fill="url(#accent)"/>
+  <path d="M116 110 L150 128 L116 146 Z" fill="#0E1014"/>
+</svg>

@@ -361,20 +361,8 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             if (mic != null) MicDevice = mic;
         }
 
-        if (string.IsNullOrWhiteSpace(SystemAudioDevice))
-        {
-            // Prefer a genuine loopback / "stereo mix"-style device for system audio…
-            var sys = AudioDevices.FirstOrDefault(d =>
-                Contains(d, "stereo mix") || Contains(d, "what u hear") || Contains(d, "loopback") ||
-                Contains(d, "virtual-audio") || Contains(d, "cable output") || Contains(d, "wave out") ||
-                Contains(d, "speakers"));
-            // …otherwise fall back to the first device that isn't the chosen mic so the
-            // dropdown is never blank (the user can change it; true system-audio capture
-            // needs "Stereo Mix" enabled or a virtual audio cable installed).
-            sys ??= AudioDevices.FirstOrDefault(d => !string.Equals(d, MicDevice, StringComparison.OrdinalIgnoreCase))
-                    ?? AudioDevices.FirstOrDefault();
-            if (sys != null) SystemAudioDevice = sys;
-        }
+        // System audio is captured automatically via WASAPI loopback (see LoopbackCapturePipe),
+        // so there is deliberately no system-device default here — only the microphone needs one.
 
         static bool Contains(string s, string term) =>
             s.IndexOf(term, StringComparison.OrdinalIgnoreCase) >= 0;
