@@ -26,6 +26,10 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         _settings = settings ?? throw new ArgumentNullException(nameof(settings));
         _profile = _settings.ActiveProfile();
 
+        // Clip length and buffer length are a single concept in the UI: keep the buffer sized
+        // to hold one full clip (with a little headroom).
+        _settings.ReplayBufferSeconds = _settings.ClipLengthSeconds + 10;
+
         // Static enum-backed option lists (populated once).
         CaptureSources = new ObservableCollection<CaptureSource>(Enum.GetValues<CaptureSource>());
         Encoders = new ObservableCollection<VideoEncoder>(Enum.GetValues<VideoEncoder>());
@@ -235,7 +239,19 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public int ClipLengthSeconds
     {
         get => _settings.ClipLengthSeconds;
-        set { if (_settings.ClipLengthSeconds != value) { _settings.ClipLengthSeconds = value; OnPropertyChanged(); OnPropertyChanged(nameof(EstimatedClipSize)); } }
+        set
+        {
+            if (_settings.ClipLengthSeconds != value)
+            {
+                _settings.ClipLengthSeconds = value;
+                // One control drives both: keep the rolling buffer sized to hold a full clip
+                // (plus a little headroom for the segment that is still being written).
+                _settings.ReplayBufferSeconds = value + 10;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(ReplayBufferSeconds));
+                OnPropertyChanged(nameof(EstimatedClipSize));
+            }
+        }
     }
 
     /// <summary>

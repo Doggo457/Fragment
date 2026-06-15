@@ -311,7 +311,6 @@
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
-                            <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
 
                         <TextBlock Grid.Row="0" Grid.ColumnSpan="3" Style="{StaticResource SectionHeader}" Text="Replay buffer &amp; clips"/>
@@ -320,29 +319,22 @@
                                   Content="Enable replay buffer"
                                   IsChecked="{Binding ReplayBufferEnabled}"/>
 
-                        <TextBlock Grid.Row="2" Grid.Column="0" Style="{StaticResource LabelText}" Text="Buffer length (seconds)"
-                                   ToolTip="How many seconds of the recent past ClipForge keeps ready in the background, so 'Save Clip' can grab footage that already happened (instant replay)."/>
+                        <TextBlock Grid.Row="2" Grid.Column="0" Style="{StaticResource LabelText}" Text="Clip length (seconds)"
+                                   ToolTip="Length of each saved clip. ClipForge always keeps this much of the recent past ready in the background, so 'Save Clip' grabs the last N seconds even after the moment happened (instant replay)."/>
                         <Slider Grid.Row="2" Grid.Column="1"
-                                Minimum="10" Maximum="600" TickFrequency="10"
-                                IsSnapToTickEnabled="True"
-                                Value="{Binding ReplayBufferSeconds}"
-                                IsEnabled="{Binding ReplayBufferEnabled}"/>
-                        <TextBox Grid.Row="2" Grid.Column="2" Text="{Binding ReplayBufferSeconds}"/>
-
-                        <TextBlock Grid.Row="3" Grid.Column="0" Style="{StaticResource LabelText}" Text="Clip length (seconds)"/>
-                        <Slider Grid.Row="3" Grid.Column="1"
                                 Minimum="5" Maximum="600" TickFrequency="5"
                                 IsSnapToTickEnabled="True"
-                                Value="{Binding ClipLengthSeconds}"/>
-                        <TextBox Grid.Row="3" Grid.Column="2" Text="{Binding ClipLengthSeconds}"/>
+                                Value="{Binding ClipLengthSeconds}"
+                                IsEnabled="{Binding ReplayBufferEnabled}"/>
+                        <TextBox Grid.Row="2" Grid.Column="2" Text="{Binding ClipLengthSeconds}"/>
 
-                        <TextBlock Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="2"
+                        <TextBlock Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="2"
                                    Foreground="{StaticResource SubtleTextBrush}"
                                    FontSize="11"
                                    Margin="0,0,0,6"
                                    Text="{Binding EstimatedClipSize}"/>
 
-                        <CheckBox Grid.Row="5" Grid.Column="1"
+                        <CheckBox Grid.Row="4" Grid.Column="1"
                                   Content="Play sound when a clip is saved"
                                   IsChecked="{Binding PlaySoundOnClip}"/>
                     </Grid>
