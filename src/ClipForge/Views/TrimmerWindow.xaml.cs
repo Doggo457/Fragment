@@ -1,115 +1,55 @@
-using System.ComponentModel;
+using System;
+using System.Globalization;
 using System.IO;
-using System.Runtime.CompilerServices;
 using System.Windows;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
+using System.Windows.Threading;
 using ClipForge.Services;
-using ClipForge.Utils;
 using Microsoft.Win32;
 
 namespace ClipForge.Views;
 
 /// <summary>
-/// Code-behind for the trimmer dialog. Hosts a <see cref="TrimmerViewModel"/>
-/// that drives a <see cref="ClipTrimmer"/> to cut a sub-range out of a video.
+/// Visual clip trimmer: previews the video, lets the user scrub a playhead and drag In/Out handles
+/// on a timeline, then writes the selected range out via <see cref="ClipTrimmer"/>.
 /// </summary>
 public partial class TrimmerWindow : Window
 {
+    private readonly ClipTrimmer _trimmer;
+    private readonly DispatcherTimer _tick;
+
+    private string? _inputPath;
+    private double _durationSec;
+    private double _startSec;
+    private double _endSec = 10;
+    private double _positionSec;
+
+    private bool _mediaReady;
+    private bool _isPlaying;
+    private bool _draggingPlayhead;
+    private bool _busy;
+    private bool _suppressBoxSync;
+
     public TrimmerWindow(ClipTrimmer trimmer, string? initialInputPath = null)
     {
         InitializeComponent();
-        var vm = new TrimmerViewModel(trimmer, this) { InputPath = initialInputPath ?? string.Empty };
-        DataContext = vm;
-    }
-
-    private void OnCloseClick(object sender, RoutedEventArgs e) => Close();
-}
-
-/// <summary>
-/// View model behind <see cref="TrimmerWindow"/>. Validates the start/end fields,
-/// derives an output path, and invokes <see cref="ClipTrimmer.TrimAsync"/>.
-/// </summary>
-internal sealed class TrimmerViewModel : INotifyPropertyChanged
-{
-    private readonly ClipTrimmer _trimmer;
-    private readonly Window _owner;
-
-    private string _inputPath = string.Empty;
-    private string _startText = "00:00:00";
-    private string _endText = "00:00:10";
-    private bool _reEncode;
-    private string _statusText = "Select an input file and a start/end range.";
-    private bool _isBusy;
-
-    public TrimmerViewModel(ClipTrimmer trimmer, Window owner)
-    {
         _trimmer = trimmer ?? throw new ArgumentNullException(nameof(trimmer));
-        _owner = owner ?? throw new ArgumentNullException(nameof(owner));
 
-        BrowseInputCommand = new RelayCommand(_ => BrowseInput(), _ => !_isBusy);
-        TrimCommand = new RelayCommand(async _ => await TrimAsync(), _ => CanTrim());
-    }
+        _tick = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
+        _tick.Tick += OnTick;
+        _tick.Start();
 
-    public RelayCommand BrowseInputCommand { get; }
-    public RelayCommand TrimCommand { get; }
+        Loaded += (_, _) => LayoutTimeline();
 
-    public string InputPath
-    {
-        get => _inputPath;
-        set { if (_inputPath != value) { _inputPath = value; OnPropertyChanged(); RaiseCommands(); } }
-    }
-
-    public string StartText
-    {
-        get => _startText;
-        set { if (_startText != value) { _startText = value; OnPropertyChanged(); RaiseCommands(); } }
-    }
-
-    public string EndText
-    {
-        get => _endText;
-        set { if (_endText != value) { _endText = value; OnPropertyChanged(); RaiseCommands(); } }
-    }
-
-    public bool ReEncode
-    {
-        get => _reEncode;
-        set { if (_reEncode != value) { _reEncode = value; OnPropertyChanged(); } }
-    }
-
-    public string StatusText
-    {
-        get => _statusText;
-        set { if (_statusText != value) { _statusText = value; OnPropertyChanged(); } }
-    }
-
-    private bool CanTrim()
-    {
-        if (_isBusy)
+        if (!string.IsNullOrWhiteSpace(initialInputPath) && File.Exists(initialInputPath))
         {
-            return false;
+            LoadMedia(initialInputPath!);
         }
-
-        if (string.IsNullOrWhiteSpace(InputPath) || !File.Exists(InputPath))
-        {
-            return false;
-        }
-
-        if (!TryParseTimeSpan(StartText, out var start) || !TryParseTimeSpan(EndText, out var end))
-        {
-            return false;
-        }
-
-        return end > start;
     }
 
-    private void RaiseCommands()
-    {
-        BrowseInputCommand.RaiseCanExecuteChanged();
-        TrimCommand.RaiseCanExecuteChanged();
-    }
-
-    private void BrowseInput()
+    // ----------------------------------------------------------------- load
+    private void OnBrowseClick(object sender, RoutedEventArgs e)
     {
         var dialog = new OpenFileDialog
         {
@@ -117,39 +57,256 @@ internal sealed class TrimmerViewModel : INotifyPropertyChanged
             Filter = "Video files|*.mp4;*.mkv;*.mov;*.webm;*.avi;*.flv|All files|*.*",
             CheckFileExists = true,
         };
-
-        if (dialog.ShowDialog(_owner) == true)
+        if (dialog.ShowDialog(this) == true)
         {
-            InputPath = dialog.FileName;
+            LoadMedia(dialog.FileName);
         }
     }
 
-    private async Task TrimAsync()
+    private void LoadMedia(string path)
     {
-        if (!TryParseTimeSpan(StartText, out var start) || !TryParseTimeSpan(EndText, out var end))
-        {
-            StatusText = "Start/end must be in hh:mm:ss(.fff) format.";
-            return;
-        }
-
-        if (end <= start)
-        {
-            StatusText = "End must be greater than start.";
-            return;
-        }
-
-        var outputPath = BuildOutputPath(InputPath, _reEncode);
+        _inputPath = path;
+        InputBox.Text = path;
+        _mediaReady = false;
+        _isPlaying = false;
+        _positionSec = 0;
+        PlayButton.IsEnabled = false;
+        PlayButton.Content = "▶ Play";
+        PreviewHint.Text = "Loading…";
+        PreviewHint.Visibility = Visibility.Visible;
+        StatusText.Text = "Loading video…";
 
         try
         {
-            SetBusy(true);
-            StatusText = "Trimming…";
-            var result = await _trimmer.TrimAsync(InputPath, start, end, outputPath, _reEncode);
-            StatusText = $"Saved: {result}";
+            Media.Stop();
+            Media.Source = new Uri(path);
+            Media.Play(); // needed to begin opening with LoadedBehavior=Manual; paused in MediaOpened
         }
         catch (Exception ex)
         {
-            StatusText = $"Trim failed: {ex.Message}";
+            StatusText.Text = $"Could not open file: {ex.Message}";
+        }
+    }
+
+    private void OnMediaOpened(object sender, RoutedEventArgs e)
+    {
+        Media.Pause();
+        _isPlaying = false;
+        _mediaReady = true;
+
+        _durationSec = Media.NaturalDuration.HasTimeSpan
+            ? Media.NaturalDuration.TimeSpan.TotalSeconds
+            : 0;
+
+        _startSec = 0;
+        _endSec = _durationSec > 0 ? _durationSec : _endSec;
+        _positionSec = 0;
+        Media.Position = TimeSpan.Zero;
+
+        PreviewHint.Visibility = Visibility.Collapsed;
+        PlayButton.IsEnabled = true;
+        PlayButton.Content = "▶ Play";
+        StatusText.Text = "Loaded — drag the In/Out handles, or scrub and use Set In / Set Out.";
+
+        UpdateUiFromState();
+    }
+
+    private void OnMediaFailed(object sender, ExceptionRoutedEventArgs e)
+    {
+        _mediaReady = false;
+        PreviewHint.Text = "Preview unavailable for this file (codec not supported by Windows).";
+        PreviewHint.Visibility = Visibility.Visible;
+        PlayButton.IsEnabled = false;
+        StatusText.Text = "Preview unavailable — you can still type Start/End below and Save the trim.";
+        // Keep whatever duration the End box implies so the timeline + trim still function.
+        if (_durationSec <= 0)
+        {
+            _durationSec = Math.Max(_endSec, 1);
+        }
+        UpdateUiFromState();
+    }
+
+    private void OnMediaEnded(object sender, RoutedEventArgs e)
+    {
+        Media.Pause();
+        _isPlaying = false;
+        PlayButton.Content = "▶ Play";
+    }
+
+    // ----------------------------------------------------------------- transport
+    private void OnPlayPauseClick(object sender, RoutedEventArgs e)
+    {
+        if (!_mediaReady) return;
+
+        if (_isPlaying)
+        {
+            Media.Pause();
+            _isPlaying = false;
+            PlayButton.Content = "▶ Play";
+        }
+        else
+        {
+            // Start playback within the selected range.
+            if (_positionSec < _startSec || _positionSec >= _endSec - 0.05)
+            {
+                Seek(_startSec);
+            }
+            Media.Play();
+            _isPlaying = true;
+            PlayButton.Content = "⏸ Pause";
+        }
+    }
+
+    private void OnJumpStartClick(object sender, RoutedEventArgs e) => Seek(_startSec);
+    private void OnJumpEndClick(object sender, RoutedEventArgs e) => Seek(Math.Max(_startSec, _endSec - 0.1));
+
+    private void OnTick(object? sender, EventArgs e)
+    {
+        if (!_isPlaying || !_mediaReady || _draggingPlayhead) return;
+
+        _positionSec = Media.Position.TotalSeconds;
+        if (_endSec > 0 && _positionSec >= _endSec)
+        {
+            Media.Pause();
+            _isPlaying = false;
+            _positionSec = _endSec;
+            Media.Position = ToTs(_endSec);
+            PlayButton.Content = "▶ Play";
+        }
+        UpdatePlayhead();
+    }
+
+    // ----------------------------------------------------------------- timeline scrub
+    private void OnTimelineMouseDown(object sender, MouseButtonEventArgs e)
+    {
+        if (_durationSec <= 0) return;
+        _draggingPlayhead = true;
+        TimelineCanvas.CaptureMouse();
+        SeekToX(e.GetPosition(TimelineCanvas).X);
+    }
+
+    private void OnTimelineMouseMove(object sender, MouseEventArgs e)
+    {
+        if (_draggingPlayhead && e.LeftButton == MouseButtonState.Pressed)
+        {
+            SeekToX(e.GetPosition(TimelineCanvas).X);
+        }
+    }
+
+    private void OnTimelineMouseUp(object sender, MouseButtonEventArgs e)
+    {
+        if (_draggingPlayhead)
+        {
+            _draggingPlayhead = false;
+            TimelineCanvas.ReleaseMouseCapture();
+        }
+    }
+
+    private void SeekToX(double x)
+    {
+        double w = TimelineCanvas.ActualWidth;
+        if (w <= 0 || _durationSec <= 0) return;
+        double t = Clamp(x / w * _durationSec, 0, _durationSec);
+        Seek(t);
+    }
+
+    private void Seek(double seconds)
+    {
+        _positionSec = Clamp(seconds, 0, _durationSec > 0 ? _durationSec : seconds);
+        if (_mediaReady)
+        {
+            Media.Position = ToTs(_positionSec);
+        }
+        UpdatePlayhead();
+    }
+
+    // ----------------------------------------------------------------- In/Out handles
+    private void OnInDrag(object sender, DragDeltaEventArgs e)
+    {
+        if (_durationSec <= 0) return;
+        double dt = e.HorizontalChange / TimelineCanvas.ActualWidth * _durationSec;
+        _startSec = Clamp(_startSec + dt, 0, _endSec - 0.1);
+        if (_mediaReady) Seek(_startSec); // preview the new in-point frame
+        UpdateUiFromState();
+    }
+
+    private void OnOutDrag(object sender, DragDeltaEventArgs e)
+    {
+        if (_durationSec <= 0) return;
+        double dt = e.HorizontalChange / TimelineCanvas.ActualWidth * _durationSec;
+        _endSec = Clamp(_endSec + dt, _startSec + 0.1, _durationSec);
+        if (_mediaReady) Seek(_endSec);
+        UpdateUiFromState();
+    }
+
+    private void OnSetInClick(object sender, RoutedEventArgs e)
+    {
+        _startSec = Clamp(_positionSec, 0, _endSec - 0.1);
+        UpdateUiFromState();
+    }
+
+    private void OnSetOutClick(object sender, RoutedEventArgs e)
+    {
+        _endSec = Clamp(_positionSec, _startSec + 0.1, _durationSec > 0 ? _durationSec : _positionSec);
+        UpdateUiFromState();
+    }
+
+    private void OnStartBoxCommitted(object sender, RoutedEventArgs e)
+    {
+        if (_suppressBoxSync) return;
+        if (TryParseTime(StartBox.Text, out var t))
+        {
+            double max = _durationSec > 0 ? _durationSec : t.TotalSeconds;
+            _startSec = Clamp(t.TotalSeconds, 0, Math.Max(0, Math.Min(max, _endSec - 0.1)));
+        }
+        UpdateUiFromState();
+    }
+
+    private void OnEndBoxCommitted(object sender, RoutedEventArgs e)
+    {
+        if (_suppressBoxSync) return;
+        if (TryParseTime(EndBox.Text, out var t))
+        {
+            _endSec = Math.Max(_startSec + 0.1, t.TotalSeconds);
+            if (_durationSec > 0) _endSec = Math.Min(_endSec, _durationSec);
+            else _durationSec = _endSec; // no preview: let the End box define the timeline length
+        }
+        UpdateUiFromState();
+    }
+
+    // ----------------------------------------------------------------- trim
+    private async void OnTrimClick(object sender, RoutedEventArgs e)
+    {
+        if (_busy) return;
+
+        if (string.IsNullOrWhiteSpace(_inputPath) || !File.Exists(_inputPath))
+        {
+            StatusText.Text = "Choose an input file first.";
+            return;
+        }
+        if (_endSec <= _startSec)
+        {
+            StatusText.Text = "The Out point must be after the In point.";
+            return;
+        }
+
+        // Pause preview so ffmpeg isn't fighting the player for the file.
+        Media.Pause();
+        _isPlaying = false;
+        PlayButton.Content = "▶ Play";
+
+        var outputPath = BuildOutputPath(_inputPath!);
+        try
+        {
+            SetBusy(true);
+            StatusText.Text = "Trimming…";
+            var result = await _trimmer.TrimAsync(
+                _inputPath!, ToTs(_startSec), ToTs(_endSec), outputPath, ReEncodeCheck.IsChecked == true);
+            StatusText.Text = $"Saved: {result}";
+        }
+        catch (Exception ex)
+        {
+            StatusText.Text = $"Trim failed: {ex.Message}";
         }
         finally
         {
@@ -159,52 +316,86 @@ internal sealed class TrimmerViewModel : INotifyPropertyChanged
 
     private void SetBusy(bool busy)
     {
-        _isBusy = busy;
-        RaiseCommands();
+        _busy = busy;
+        TrimButton.IsEnabled = !busy;
     }
 
-    /// <summary>Derives an output path next to the input, suffixed with "_trim".</summary>
-    private static string BuildOutputPath(string inputPath, bool reEncode)
+    private void OnCloseClick(object sender, RoutedEventArgs e) => Close();
+
+    protected override void OnClosed(EventArgs e)
     {
-        var dir = Path.GetDirectoryName(inputPath) ?? Directory.GetCurrentDirectory();
-        var name = Path.GetFileNameWithoutExtension(inputPath);
-        var ext = Path.GetExtension(inputPath);
-        if (string.IsNullOrEmpty(ext))
-        {
-            ext = ".mp4";
-        }
-
-        var candidate = Path.Combine(dir, $"{name}_trim{ext}");
-        var index = 1;
-        while (File.Exists(candidate))
-        {
-            candidate = Path.Combine(dir, $"{name}_trim_{index}{ext}");
-            index++;
-        }
-
-        return candidate;
+        _tick.Stop();
+        try { Media.Stop(); Media.Close(); } catch { }
+        base.OnClosed(e);
     }
 
-    /// <summary>
-    /// Parses "hh:mm:ss", "mm:ss", "ss", or a fractional-seconds variant into a
-    /// <see cref="TimeSpan"/>. Returns false on malformed input.
-    /// </summary>
-    private static bool TryParseTimeSpan(string? text, out TimeSpan value)
+    // ----------------------------------------------------------------- layout / formatting
+    private void OnTimelineSizeChanged(object sender, SizeChangedEventArgs e) => LayoutTimeline();
+
+    private void UpdateUiFromState()
+    {
+        _suppressBoxSync = true;
+        StartBox.Text = Fmt(_startSec);
+        EndBox.Text = Fmt(_endSec);
+        _suppressBoxSync = false;
+        DurationRun.Text = Fmt(_durationSec);
+        UpdatePlayhead();
+    }
+
+    private void UpdatePlayhead()
+    {
+        PositionRun.Text = Fmt(_positionSec);
+        LayoutTimeline();
+    }
+
+    private void LayoutTimeline()
+    {
+        double w = TimelineCanvas.ActualWidth;
+        if (w <= 0) return;
+
+        TrackRect.Width = w;
+
+        if (_durationSec <= 0)
+        {
+            SelRect.Width = 0;
+            return;
+        }
+
+        double sx = Clamp(_startSec / _durationSec * w, 0, w);
+        double ex = Clamp(_endSec / _durationSec * w, 0, w);
+        double px = Clamp(_positionSec / _durationSec * w, 0, w);
+
+        System.Windows.Controls.Canvas.SetLeft(SelRect, sx);
+        SelRect.Width = Math.Max(0, ex - sx);
+
+        System.Windows.Controls.Canvas.SetLeft(PlayLine, px - PlayLine.Width / 2);
+        System.Windows.Controls.Canvas.SetLeft(InThumb, sx - InThumb.Width / 2);
+        System.Windows.Controls.Canvas.SetLeft(OutThumb, ex - OutThumb.Width / 2);
+    }
+
+    private static double Clamp(double v, double min, double max)
+        => max < min ? min : (v < min ? min : (v > max ? max : v));
+
+    private static TimeSpan ToTs(double seconds) => TimeSpan.FromSeconds(seconds < 0 ? 0 : seconds);
+
+    private static string Fmt(double seconds)
+    {
+        if (seconds < 0) seconds = 0;
+        var t = TimeSpan.FromSeconds(seconds);
+        return $"{(int)t.TotalHours:00}:{t.Minutes:00}:{t.Seconds:00}.{t.Milliseconds / 100}";
+    }
+
+    /// <summary>Parses "hh:mm:ss(.f)", "mm:ss(.f)", or plain seconds into a TimeSpan.</summary>
+    private static bool TryParseTime(string? text, out TimeSpan value)
     {
         value = TimeSpan.Zero;
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return false;
-        }
-
+        if (string.IsNullOrWhiteSpace(text)) return false;
         text = text.Trim();
 
-        // Plain seconds (possibly fractional), e.g. "12" or "12.5".
-        if (double.TryParse(text, System.Globalization.NumberStyles.Float,
-                System.Globalization.CultureInfo.InvariantCulture, out var seconds)
-            && !text.Contains(':'))
+        var inv = CultureInfo.InvariantCulture;
+        if (!text.Contains(':') && double.TryParse(text, NumberStyles.Float, inv, out var secs))
         {
-            value = TimeSpan.FromSeconds(seconds);
+            value = TimeSpan.FromSeconds(secs);
             return value >= TimeSpan.Zero;
         }
 
@@ -214,38 +405,38 @@ internal sealed class TrimmerViewModel : INotifyPropertyChanged
             switch (parts.Length)
             {
                 case 2:
-                    {
-                        // mm:ss(.fff)
-                        var m = int.Parse(parts[0], System.Globalization.CultureInfo.InvariantCulture);
-                        var s = double.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture);
-                        value = TimeSpan.FromMinutes(m) + TimeSpan.FromSeconds(s);
-                        return value >= TimeSpan.Zero;
-                    }
+                    value = TimeSpan.FromMinutes(int.Parse(parts[0], inv))
+                            + TimeSpan.FromSeconds(double.Parse(parts[1], inv));
+                    return value >= TimeSpan.Zero;
                 case 3:
-                    {
-                        // hh:mm:ss(.fff)
-                        var h = int.Parse(parts[0], System.Globalization.CultureInfo.InvariantCulture);
-                        var m = int.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture);
-                        var s = double.Parse(parts[2], System.Globalization.CultureInfo.InvariantCulture);
-                        value = TimeSpan.FromHours(h) + TimeSpan.FromMinutes(m) + TimeSpan.FromSeconds(s);
-                        return value >= TimeSpan.Zero;
-                    }
+                    value = TimeSpan.FromHours(int.Parse(parts[0], inv))
+                            + TimeSpan.FromMinutes(int.Parse(parts[1], inv))
+                            + TimeSpan.FromSeconds(double.Parse(parts[2], inv));
+                    return value >= TimeSpan.Zero;
                 default:
                     return false;
             }
         }
-        catch (FormatException)
-        {
-            return false;
-        }
-        catch (OverflowException)
+        catch (Exception)
         {
             return false;
         }
     }
 
-    public event PropertyChangedEventHandler? PropertyChanged;
+    private static string BuildOutputPath(string inputPath)
+    {
+        var dir = Path.GetDirectoryName(inputPath) ?? Directory.GetCurrentDirectory();
+        var name = Path.GetFileNameWithoutExtension(inputPath);
+        var ext = Path.GetExtension(inputPath);
+        if (string.IsNullOrEmpty(ext)) ext = ".mp4";
 
-    private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
-        => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+        var candidate = Path.Combine(dir, $"{name}_trim{ext}");
+        var index = 2;
+        while (File.Exists(candidate))
+        {
+            candidate = Path.Combine(dir, $"{name}_trim_{index}{ext}");
+            index++;
+        }
+        return candidate;
+    }
 }

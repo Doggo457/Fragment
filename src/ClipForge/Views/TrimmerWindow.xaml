@@ -3,126 +3,147 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="ClipForge — Trim"
         Icon="/app.ico"
-        Width="560" Height="340"
-        MinWidth="500" MinHeight="320"
+        Width="860" Height="660"
+        MinWidth="720" MinHeight="580"
         WindowStartupLocation="CenterOwner"
-        Background="#1E1E1E"
-        Foreground="#E6E6E6"
-        FontFamily="Segoe UI"
-        FontSize="13">
+        Background="{StaticResource WindowBackgroundBrush}"
+        Foreground="{StaticResource ForegroundBrush}"
+        FontFamily="Segoe UI" FontSize="13">
 
     <Window.Resources>
-        <SolidColorBrush x:Key="PanelBrush" Color="#252526"/>
-        <SolidColorBrush x:Key="ControlBrush" Color="#2D2D30"/>
-        <SolidColorBrush x:Key="BorderBrush" Color="#3F3F46"/>
-        <SolidColorBrush x:Key="AccentBrush" Color="#00B3FF"/>
-        <SolidColorBrush x:Key="TextBrush" Color="#E6E6E6"/>
-        <SolidColorBrush x:Key="SubtleTextBrush" Color="#9D9D9D"/>
-
-        <Style TargetType="TextBlock">
-            <Setter Property="Foreground" Value="{StaticResource TextBrush}"/>
-            <Setter Property="VerticalAlignment" Value="Center"/>
-        </Style>
-
         <Style x:Key="LabelText" TargetType="TextBlock">
-            <Setter Property="Foreground" Value="{StaticResource SubtleTextBrush}"/>
+            <Setter Property="Foreground" Value="{StaticResource SubtleForegroundBrush}"/>
             <Setter Property="VerticalAlignment" Value="Center"/>
-            <Setter Property="Margin" Value="0,8,12,8"/>
+            <Setter Property="Margin" Value="0,0,12,0"/>
         </Style>
 
-        <Style TargetType="TextBox">
-            <Setter Property="Background" Value="{StaticResource ControlBrush}"/>
-            <Setter Property="Foreground" Value="{StaticResource TextBrush}"/>
-            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}"/>
-            <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="Padding" Value="6,4"/>
-            <Setter Property="Margin" Value="0,8,0,8"/>
-            <Setter Property="CaretBrush" Value="{StaticResource AccentBrush}"/>
+        <!-- Draggable in/out handle -->
+        <Style x:Key="HandleThumb" TargetType="Thumb">
+            <Setter Property="Width" Value="14"/>
+            <Setter Property="Cursor" Value="SizeWE"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Thumb">
+                        <Border Background="{StaticResource AccentBrush}" CornerRadius="3" />
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
         </Style>
 
-        <Style TargetType="CheckBox">
-            <Setter Property="Foreground" Value="{StaticResource TextBrush}"/>
+        <Style x:Key="MonoTime" TargetType="TextBlock">
+            <Setter Property="FontFamily" Value="Consolas"/>
             <Setter Property="VerticalAlignment" Value="Center"/>
-            <Setter Property="Margin" Value="0,8,0,8"/>
-        </Style>
-
-        <Style x:Key="DialogButton" TargetType="Button">
-            <Setter Property="Background" Value="{StaticResource ControlBrush}"/>
-            <Setter Property="Foreground" Value="{StaticResource TextBrush}"/>
-            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}"/>
-            <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="Padding" Value="14,6"/>
-            <Setter Property="Margin" Value="8,0,0,0"/>
-            <Setter Property="Cursor" Value="Hand"/>
-        </Style>
-
-        <Style x:Key="AccentButton" TargetType="Button" BasedOn="{StaticResource DialogButton}">
-            <Setter Property="Background" Value="{StaticResource AccentBrush}"/>
-            <Setter Property="Foreground" Value="#0A0A0A"/>
-            <Setter Property="FontWeight" Value="SemiBold"/>
-            <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+            <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}"/>
         </Style>
     </Window.Resources>
 
-    <Grid Margin="20">
-        <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="120"/>
-            <ColumnDefinition Width="*"/>
-            <ColumnDefinition Width="Auto"/>
-        </Grid.ColumnDefinitions>
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
+    <DockPanel LastChildFill="True">
 
-        <TextBlock Grid.Row="0" Grid.ColumnSpan="3"
-                   Text="Trim a clip"
-                   Foreground="{StaticResource AccentBrush}"
-                   FontSize="16" FontWeight="SemiBold"
-                   Margin="0,0,0,8"/>
+        <!-- ===== Input file ===== -->
+        <Grid DockPanel.Dock="Top" Margin="16,14,16,8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Style="{StaticResource LabelText}" Text="Input file"/>
+            <TextBox Grid.Column="1" x:Name="InputBox" IsReadOnly="True" VerticalContentAlignment="Center"/>
+            <Button Grid.Column="2" Content="Browse…" Margin="8,0,0,0" Click="OnBrowseClick"/>
+        </Grid>
 
-        <TextBlock Grid.Row="1" Grid.Column="0" Style="{StaticResource LabelText}" Text="Input file"/>
-        <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding InputPath, UpdateSourceTrigger=PropertyChanged}"/>
-        <Button Grid.Row="1" Grid.Column="2"
-                Content="Browse…"
-                Style="{StaticResource DialogButton}"
-                Margin="8,8,0,8"
-                Command="{Binding BrowseInputCommand}"/>
+        <!-- ===== Bottom action bar ===== -->
+        <Border DockPanel.Dock="Bottom"
+                Background="{StaticResource PanelBackgroundBrush}"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,1,0,0"
+                Padding="16,10">
+            <Grid>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <CheckBox x:Name="ReEncodeCheck" Content="Re-encode (slower, frame-accurate; off = fast stream copy)"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button x:Name="TrimButton" Content="Save trimmed clip" Style="{StaticResource AccentButton}" Click="OnTrimClick"/>
+                    <Button Content="Close" Margin="8,0,0,0" Click="OnCloseClick"/>
+                </StackPanel>
+            </Grid>
+        </Border>
 
-        <TextBlock Grid.Row="2" Grid.Column="0" Style="{StaticResource LabelText}" Text="Start (hh:mm:ss)"/>
-        <TextBox Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2"
-                 Text="{Binding StartText, UpdateSourceTrigger=PropertyChanged}"/>
+        <!-- ===== Preview + timeline ===== -->
+        <Grid Margin="16,8,16,12">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*"/>     <!-- video -->
+                <RowDefinition Height="Auto"/>  <!-- transport -->
+                <RowDefinition Height="Auto"/>  <!-- timeline -->
+                <RowDefinition Height="Auto"/>  <!-- in/out controls -->
+                <RowDefinition Height="Auto"/>  <!-- status -->
+            </Grid.RowDefinitions>
 
-        <TextBlock Grid.Row="3" Grid.Column="0" Style="{StaticResource LabelText}" Text="End (hh:mm:ss)"/>
-        <TextBox Grid.Row="3" Grid.Column="1" Grid.ColumnSpan="2"
-                 Text="{Binding EndText, UpdateSourceTrigger=PropertyChanged}"/>
+            <!-- Video preview -->
+            <Border Grid.Row="0" Background="#FF000000" CornerRadius="8" ClipToBounds="True">
+                <Grid>
+                    <MediaElement x:Name="Media"
+                                  LoadedBehavior="Manual"
+                                  UnloadedBehavior="Manual"
+                                  ScrubbingEnabled="True"
+                                  Stretch="Uniform"
+                                  MediaOpened="OnMediaOpened"
+                                  MediaFailed="OnMediaFailed"
+                                  MediaEnded="OnMediaEnded"/>
+                    <TextBlock x:Name="PreviewHint"
+                               Text="Open a video to preview and trim it"
+                               Foreground="{StaticResource SubtleForegroundBrush}"
+                               HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                </Grid>
+            </Border>
 
-        <CheckBox Grid.Row="4" Grid.Column="1" Grid.ColumnSpan="2"
-                  Content="Re-encode (slower, frame-accurate; off = fast stream copy)"
-                  IsChecked="{Binding ReEncode}"/>
+            <!-- Transport -->
+            <Grid Grid.Row="1" Margin="0,10,0,6">
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button x:Name="PlayButton" Content="▶ Play" Width="92" Click="OnPlayPauseClick" IsEnabled="False"/>
+                    <Button Content="⟲ Start" Margin="8,0,0,0" Click="OnJumpStartClick" ToolTip="Jump to the In point"/>
+                    <Button Content="End ⟳" Margin="8,0,0,0" Click="OnJumpEndClick" ToolTip="Jump to the Out point"/>
+                </StackPanel>
+                <TextBlock HorizontalAlignment="Right" Style="{StaticResource MonoTime}">
+                    <Run x:Name="PositionRun" Text="00:00:00.0"/><Run Text="  /  " Foreground="{StaticResource SubtleForegroundBrush}"/><Run x:Name="DurationRun" Text="00:00:00.0" Foreground="{StaticResource SubtleForegroundBrush}"/>
+                </TextBlock>
+            </Grid>
 
-        <TextBlock Grid.Row="5" Grid.ColumnSpan="3"
-                   Text="{Binding StatusText}"
-                   Foreground="{StaticResource SubtleTextBrush}"
-                   TextWrapping="Wrap"
-                   VerticalAlignment="Top"
-                   Margin="0,8,0,0"/>
+            <!-- Timeline -->
+            <Border Grid.Row="2" Background="{StaticResource PanelBackgroundBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="8" Padding="7,0">
+                <Canvas x:Name="TimelineCanvas" Height="56" Background="Transparent"
+                        SizeChanged="OnTimelineSizeChanged"
+                        MouseLeftButtonDown="OnTimelineMouseDown"
+                        MouseMove="OnTimelineMouseMove"
+                        MouseLeftButtonUp="OnTimelineMouseUp">
+                    <Rectangle x:Name="TrackRect" Height="10" RadiusX="5" RadiusY="5" Canvas.Top="23"
+                               Fill="{StaticResource ControlBackgroundBrush}"/>
+                    <Rectangle x:Name="SelRect" Height="10" RadiusX="5" RadiusY="5" Canvas.Top="23"
+                               Fill="{StaticResource AccentBrush}" Opacity="0.45"/>
+                    <Rectangle x:Name="PlayLine" Width="2" Height="44" Canvas.Top="6"
+                               Fill="{StaticResource ForegroundBrush}"/>
+                    <Thumb x:Name="InThumb" Height="44" Canvas.Top="6" Style="{StaticResource HandleThumb}" DragDelta="OnInDrag"/>
+                    <Thumb x:Name="OutThumb" Height="44" Canvas.Top="6" Style="{StaticResource HandleThumb}" DragDelta="OnOutDrag"/>
+                </Canvas>
+            </Border>
 
-        <StackPanel Grid.Row="6" Grid.ColumnSpan="3"
-                    Orientation="Horizontal"
-                    HorizontalAlignment="Right"
-                    Margin="0,12,0,0">
-            <Button Content="Close"
-                    Style="{StaticResource DialogButton}"
-                    Click="OnCloseClick"/>
-            <Button Content="Trim"
-                    Style="{StaticResource AccentButton}"
-                    Command="{Binding TrimCommand}"/>
-        </StackPanel>
-    </Grid>
+            <!-- In / Out controls -->
+            <Grid Grid.Row="3" Margin="0,10,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <Button Grid.Column="0" Content="[ Set In" Click="OnSetInClick" ToolTip="Set the clip start to the current playhead"/>
+                <TextBox Grid.Column="1" x:Name="StartBox" Width="110" Margin="8,0,0,0" Text="00:00:00.0" LostKeyboardFocus="OnStartBoxCommitted" ToolTip="Clip start (hh:mm:ss.f)"/>
+                <Button Grid.Column="3" x:Name="SetOutButton" Content="Set Out ]" Click="OnSetOutClick" ToolTip="Set the clip end to the current playhead"/>
+                <TextBox Grid.Column="4" x:Name="EndBox" Width="110" Margin="8,0,0,0" Text="00:00:10.0" LostKeyboardFocus="OnEndBoxCommitted" ToolTip="Clip end (hh:mm:ss.f)"/>
+            </Grid>
+
+            <TextBlock Grid.Row="4" x:Name="StatusText" Margin="2,10,0,0"
+                       Foreground="{StaticResource SubtleForegroundBrush}" TextWrapping="Wrap"
+                       Text="Open a clip, then drag the In/Out handles (or scrub the playhead and use Set In / Set Out)."/>
+        </Grid>
+    </DockPanel>
 </Window>
