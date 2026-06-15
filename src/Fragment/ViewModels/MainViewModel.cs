@@ -377,6 +377,11 @@ namespace Fragment.ViewModels
                 StatusText = saved != null
                     ? $"Saved clip: {Path.GetFileName(saved)}"
                     : "Failed to save clip";
+
+                if (saved != null)
+                {
+                    NotificationService.ShowClipSaved(saved);
+                }
             }
             catch (Exception ex)
             {
@@ -534,6 +539,14 @@ namespace Fragment.ViewModels
                 StatusText = string.IsNullOrEmpty(outputPath)
                     ? "Stopped"
                     : $"Saved: {Path.GetFileName(outputPath)}";
+
+                // Only announce a real saved file: ffmpeg can exit 255 on an early
+                // interrupt without having written usable output.
+                if (!string.IsNullOrEmpty(outputPath) && File.Exists(outputPath))
+                {
+                    NotificationService.ShowRecordingSaved(outputPath);
+                }
+
                 RefreshCanExecute();
             }
 

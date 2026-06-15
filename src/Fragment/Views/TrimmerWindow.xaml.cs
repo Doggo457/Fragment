@@ -330,6 +330,7 @@ public partial class TrimmerWindow : Window
             var result = await _trimmer.TrimAsync(
                 _inputPath!, ToTs(_startSec), ToTs(_endSec), outputPath, ReEncodeCheck.IsChecked == true);
             StatusText.Text = $"Saved: {result}";
+            NotificationService.ShowClipSaved(result);
         }
         catch (Exception ex)
         {
