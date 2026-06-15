@@ -363,7 +363,13 @@ namespace ClipForge.ViewModels
         {
             try
             {
-                var window = new Views.TrimmerWindow();
+                if (!FfmpegLocator.IsValid(_ffmpegPath))
+                {
+                    StatusText = "FFmpeg not found — set its path in Settings";
+                    return;
+                }
+
+                var window = new Views.TrimmerWindow(new ClipTrimmer(_ffmpegPath!));
 
                 if (Application.Current?.MainWindow is { } owner && !ReferenceEquals(owner, window))
                 {

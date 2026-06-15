@@ -60,7 +60,7 @@
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
                 </Setter.Value>
-            </Style.Setters>
+            </Setter>
         </Style>
 
         <!-- Large primary record button style. -->
