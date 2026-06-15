@@ -195,7 +195,8 @@
                                                   Content="{TemplateBinding SelectionBoxItem}"
                                                   ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}" />
                                 <TextBox x:Name="PART_EditableTextBox"
-                                         Margin="9,0,34,0"
+                                         Margin="11,0,34,0"
+                                         Padding="0"
                                          VerticalAlignment="Center"
                                          VerticalContentAlignment="Center"
                                          Background="Transparent"
@@ -204,7 +205,17 @@
                                          CaretBrush="{StaticResource AccentBrush}"
                                          Focusable="True"
                                          Visibility="Collapsed"
-                                         IsReadOnly="{TemplateBinding IsReadOnly}" />
+                                         IsReadOnly="{TemplateBinding IsReadOnly}">
+                                    <TextBox.Template>
+                                        <ControlTemplate TargetType="{x:Type TextBox}">
+                                            <ScrollViewer x:Name="PART_ContentHost"
+                                                          Focusable="False"
+                                                          VerticalAlignment="Center"
+                                                          VerticalScrollBarVisibility="Hidden"
+                                                          HorizontalScrollBarVisibility="Hidden" />
+                                        </ControlTemplate>
+                                    </TextBox.Template>
+                                </TextBox>
                                 <Popup x:Name="PART_Popup"
                                        Placement="Bottom"
                                        AllowsTransparency="True"

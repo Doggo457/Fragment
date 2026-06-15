@@ -261,7 +261,9 @@
                                   ItemsSource="{Binding AudioModes}"
                                   SelectedItem="{Binding Audio}"/>
                         <Button Grid.Row="1" Grid.Column="2"
-                                Content="Refresh"
+                                Content="↻"
+                                FontSize="16"
+                                ToolTip="Refresh device list"
                                 Style="{StaticResource DialogButton}"
                                 Margin="8,6,0,6"
                                 Command="{Binding RefreshDevicesCommand}"/>
