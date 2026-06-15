@@ -170,7 +170,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public int VideoBitrateKbps
     {
         get => _profile.VideoBitrateKbps;
-        set { if (_profile.VideoBitrateKbps != value) { _profile.VideoBitrateKbps = value; OnPropertyChanged(); } }
+        set { if (_profile.VideoBitrateKbps != value) { _profile.VideoBitrateKbps = value; OnPropertyChanged(); OnPropertyChanged(nameof(EstimatedClipSize)); } }
     }
 
     public RatePreset Preset
@@ -192,7 +192,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public AudioMode Audio
     {
         get => _profile.Audio;
-        set { if (_profile.Audio != value) { _profile.Audio = value; OnPropertyChanged(); OnPropertyChanged(nameof(UsesSystemAudio)); OnPropertyChanged(nameof(UsesMic)); } }
+        set { if (_profile.Audio != value) { _profile.Audio = value; OnPropertyChanged(); OnPropertyChanged(nameof(UsesSystemAudio)); OnPropertyChanged(nameof(UsesMic)); OnPropertyChanged(nameof(EstimatedClipSize)); } }
     }
 
     public bool UsesSystemAudio => _profile.Audio is AudioMode.SystemOnly or AudioMode.SystemAndMic;
@@ -213,7 +213,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public int AudioBitrateKbps
     {
         get => _profile.AudioBitrateKbps;
-        set { if (_profile.AudioBitrateKbps != value) { _profile.AudioBitrateKbps = value; OnPropertyChanged(); } }
+        set { if (_profile.AudioBitrateKbps != value) { _profile.AudioBitrateKbps = value; OnPropertyChanged(); OnPropertyChanged(nameof(EstimatedClipSize)); } }
     }
 
     // ===================================================================
@@ -235,7 +235,24 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public int ClipLengthSeconds
     {
         get => _settings.ClipLengthSeconds;
-        set { if (_settings.ClipLengthSeconds != value) { _settings.ClipLengthSeconds = value; OnPropertyChanged(); } }
+        set { if (_settings.ClipLengthSeconds != value) { _settings.ClipLengthSeconds = value; OnPropertyChanged(); OnPropertyChanged(nameof(EstimatedClipSize)); } }
+    }
+
+    /// <summary>
+    /// A rough estimate of how big one saved clip will be at the current video+audio bitrate and
+    /// clip length, so the user knows the disk cost before saving. Recomputed when any of those change.
+    /// </summary>
+    public string EstimatedClipSize
+    {
+        get
+        {
+            int audioKbps = _profile.Audio == AudioMode.None ? 0 : _profile.AudioBitrateKbps;
+            double totalKbps = _profile.VideoBitrateKbps + audioKbps;
+            double bytes = totalKbps * 1000.0 / 8.0 * ClipLengthSeconds; // kbit/s -> bytes
+            double mb = bytes / (1024.0 * 1024.0);
+            string size = mb >= 1024 ? $"{mb / 1024.0:0.0} GB" : $"{mb:0} MB";
+            return $"(~{size} per clip at current bitrate)";
+        }
     }
 
     public bool PlaySoundOnClip
