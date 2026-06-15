@@ -47,8 +47,9 @@ public sealed class HotkeyService : IDisposable
 
         var id = _nextId++;
 
-        // MOD_NOREPEAT-style behaviour is omitted intentionally to match the contract's modifier set.
-        if (!NativeMethods.RegisterHotKey(_windowHandle, id, modifiers, vk))
+        // MOD_NOREPEAT prevents a held-down hotkey from auto-repeating into a storm of WM_HOTKEY
+        // messages (which would rapidly start/stop recording).
+        if (!NativeMethods.RegisterHotKey(_windowHandle, id, modifiers | NativeMethods.MOD_NOREPEAT, vk))
         {
             throw new InvalidOperationException(
                 $"Failed to register hotkey (modifiers=0x{modifiers:X}, vk=0x{vk:X}). It may already be in use.");

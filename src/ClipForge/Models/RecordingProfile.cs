@@ -76,6 +76,9 @@ public class RecordingProfile
     /// </summary>
     public string FileNameTemplate { get; set; } = "ClipForge_{date}_{time}";
 
+    /// <summary>Deep copy. All members are value types or immutable strings, so a memberwise clone suffices.</summary>
+    public RecordingProfile Clone() => (RecordingProfile)MemberwiseClone();
+
     private static string GetDefaultOutputFolder()
     {
         var videos = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);

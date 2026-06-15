@@ -16,6 +16,7 @@ namespace ClipForge.ViewModels;
 /// </summary>
 public sealed class SettingsViewModel : INotifyPropertyChanged
 {
+    private readonly AppSettings _original;
     private readonly AppSettings _settings;
     private readonly RecordingProfile _profile;
     private DeviceEnumerator? _deviceEnumerator;
@@ -23,7 +24,9 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
 
     public SettingsViewModel(AppSettings settings)
     {
-        _settings = settings ?? throw new ArgumentNullException(nameof(settings));
+        _original = settings ?? throw new ArgumentNullException(nameof(settings));
+        // Edit a throwaway copy; nothing touches the live settings unless the user clicks Save.
+        _settings = _original.Clone();
         _profile = _settings.ActiveProfile();
 
         // Clip length and buffer length are a single concept in the UI: keep the buffer sized
@@ -401,8 +404,12 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
             s.IndexOf(term, StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
-    /// <summary>Persists the (already mutated) settings to disk.</summary>
-    public void Save() => SettingsService.Save(_settings);
+    /// <summary>Commits the edited copy back to the live settings and persists it to disk.</summary>
+    public void Save()
+    {
+        _original.CopyFrom(_settings);
+        SettingsService.Save(_original);
+    }
 
     /// <summary>The underlying settings model, for callers that need it after editing.</summary>
     public AppSettings Settings => _settings;

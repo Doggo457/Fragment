@@ -81,7 +81,8 @@ public sealed class ScreenRecorder
             Directory.CreateDirectory(Path.GetDirectoryName(outputPath)!);
 
             // Real system-audio capture via WASAPI loopback — no "Stereo Mix" device needed.
-            if (profile.Audio is AudioMode.SystemOnly or AudioMode.SystemAndMic)
+            // GIF has no audio track, so don't start a capture that ffmpeg would never read.
+            if (profile.Container != OutputContainer.Gif && profile.Audio is AudioMode.SystemOnly or AudioMode.SystemAndMic)
             {
                 try
                 {
@@ -119,37 +120,42 @@ public sealed class ScreenRecorder
             RedirectStandardOutput = true,
         };
 
-        Process process;
+        // Each launch owns its own loopback pipe; the exit handler captures both so a stale exit
+        // from a previous session can never tear down a freshly-started one.
+        var sessionLoopback = _loopback;
+        var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+        process.Exited += (_, _) => OnProcessExited(process, sessionLoopback);
+        process.ErrorDataReceived += OnErrorDataReceived;
+
+        // Publish state under the lock BEFORE Start() so an instant exit's handler sees this process.
+        lock (_gate)
+        {
+            _process = process;
+            CurrentOutputPath = outputPath;
+        }
+
         try
         {
-            process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-            process.Exited += OnProcessExited;
-            process.ErrorDataReceived += OnErrorDataReceived;
-
             if (!process.Start())
             {
-                Error?.Invoke(this, "ffmpeg process failed to start.");
+                lock (_gate) { if (ReferenceEquals(_process, process)) { _process = null; CurrentOutputPath = null; } _loopback = null; }
                 process.Dispose();
-                _loopback?.Dispose();
-                _loopback = null;
+                sessionLoopback?.Dispose();
+                Error?.Invoke(this, "ffmpeg process failed to start.");
                 return Task.CompletedTask;
             }
 
+            ChildProcessTracker.Track(process); // dies with ClipForge no matter how it exits
             process.BeginErrorReadLine();
             process.BeginOutputReadLine();
         }
         catch (Exception ex)
         {
-            _loopback?.Dispose();
-            _loopback = null;
+            lock (_gate) { if (ReferenceEquals(_process, process)) { _process = null; CurrentOutputPath = null; } _loopback = null; }
+            try { process.Dispose(); } catch { }
+            sessionLoopback?.Dispose();
             Error?.Invoke(this, $"Unable to launch ffmpeg: {ex.Message}");
             return Task.CompletedTask;
-        }
-
-        lock (_gate)
-        {
-            _process = process;
-            CurrentOutputPath = outputPath;
         }
 
         Started?.Invoke(this, EventArgs.Empty);
@@ -191,17 +197,12 @@ public sealed class ScreenRecorder
         catch (OperationCanceledException)
         {
             // ffmpeg ignored the graceful request — terminate it so the file is at least closed.
-            try
-            {
-                if (!process.HasExited)
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-            }
-            catch (Exception)
-            {
-                // Nothing further we can do.
-            }
+            try { if (!process.HasExited) process.Kill(entireProcessTree: true); }
+            catch (Exception) { }
+        }
+        catch (Exception)
+        {
+            // The Exited handler may have disposed the process concurrently; that's a clean stop.
         }
     }
 
@@ -211,44 +212,40 @@ public sealed class ScreenRecorder
         // Consumers wanting live progress can subscribe to a future event here.
     }
 
-    private void OnProcessExited(object? sender, EventArgs e)
+    // Bound to a specific (process, loopback) session via the Exited lambda, so a late exit from an
+    // old recording disposes only its own resources and never clobbers a newer session's state/UI.
+    private void OnProcessExited(Process process, LoopbackCapturePipe? loopback)
     {
-        Process? process;
-        string? output;
+        bool wasCurrent = false;
+        string? output = null;
         lock (_gate)
         {
-            process = _process;
-            output = CurrentOutputPath;
-            _process = null;
+            if (ReferenceEquals(_process, process))
+            {
+                wasCurrent = true;
+                output = CurrentOutputPath;
+                _process = null;
+                CurrentOutputPath = null;
+            }
+            if (ReferenceEquals(_loopback, loopback))
+            {
+                _loopback = null;
+            }
         }
 
         int exitCode = -1;
-        try
+        try { exitCode = process.ExitCode; } catch (Exception) { }
+        try { process.Dispose(); } catch (Exception) { }
+        loopback?.Dispose();
+
+        if (!wasCurrent)
         {
-            if (process is not null)
-            {
-                exitCode = process.ExitCode;
-            }
-        }
-        catch (Exception)
-        {
-            // ExitCode can throw if the process object is in a bad state.
-        }
-        finally
-        {
-            process?.Dispose();
+            return; // stale exit from a superseded session — don't touch the current UI/state
         }
 
         var path = output ?? string.Empty;
-        CurrentOutputPath = null;
 
-        // Stop WASAPI loopback capture now that ffmpeg has exited.
-        var loopback = _loopback;
-        _loopback = null;
-        loopback?.Dispose();
-
-        // ffmpeg returns 0 on a clean 'q' stop. Exit code 255 is the conventional result of an
-        // interrupt; treat it as a successful user-initiated stop because the file is still finalized.
+        // ffmpeg returns 0 on a clean 'q' stop; 255 is the conventional interrupt result (file still finalized).
         if (exitCode == 0 || exitCode == 255)
         {
             Stopped?.Invoke(this, path);
@@ -318,7 +315,8 @@ public sealed class ScreenRecorder
         AppendVideoInput(sb, profile);
 
         // ---- Audio inputs (WASAPI loopback pipe and/or dshow), if any ----
-        var audioInputs = AppendAudioInputs(sb, profile, loopback);
+        // GIF output carries no audio, so don't declare audio inputs that would go unmapped.
+        var audioInputs = profile.Container == OutputContainer.Gif ? 0 : AppendAudioInputs(sb, profile, loopback);
 
         // ---- Encoding / mapping ----
         AppendEncoding(sb, profile, audioInputs);

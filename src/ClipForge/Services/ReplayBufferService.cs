@@ -115,41 +115,94 @@ public sealed class ReplayBufferService
         };
 
         var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-        if (!process.Start())
-        {
-            process.Dispose();
-            _loopback?.Dispose();
-            _loopback = null;
-            throw new InvalidOperationException("Failed to start the replay buffer ffmpeg process.");
-        }
+        var sessionLoopback = _loopback;
+        process.Exited += (_, _) => OnBufferExited(process, sessionLoopback, bufferDir);
 
-        process.BeginErrorReadLine();
-        process.BeginOutputReadLine();
-
+        // Publish under the lock before Start() so an instant exit's handler sees this session.
         lock (_gate)
         {
             _process = process;
             _bufferDir = bufferDir;
             _profile = profile;
         }
+
+        try
+        {
+            if (!process.Start())
+            {
+                throw new InvalidOperationException("ffmpeg process did not start.");
+            }
+            ChildProcessTracker.Track(process); // dies with ClipForge no matter how it exits
+            process.BeginErrorReadLine();
+            process.BeginOutputReadLine();
+        }
+        catch (Exception ex)
+        {
+            lock (_gate)
+            {
+                if (ReferenceEquals(_process, process)) { _process = null; _bufferDir = null; }
+                _loopback = null;
+            }
+            try { process.Dispose(); } catch { }
+            sessionLoopback?.Dispose();
+            TryDeleteDirectory(bufferDir);
+            throw new InvalidOperationException("Failed to start the replay buffer ffmpeg process.", ex);
+        }
     }
 
-    /// <summary>Stops the buffering process. Retained segments remain on disk until the next Start.</summary>
+    /// <summary>
+    /// Fires when the buffer ffmpeg exits on its own (crash / encoder failure) without Stop() being
+    /// called, so the view model can reflect that the buffer is no longer running.
+    /// </summary>
+    public event EventHandler? Stopped;
+
+    // Bound to a specific session; disposes only that session's own resources.
+    private void OnBufferExited(Process process, LoopbackCapturePipe? loopback, string? dir)
+    {
+        bool wasCurrent;
+        lock (_gate)
+        {
+            wasCurrent = ReferenceEquals(_process, process);
+            if (wasCurrent)
+            {
+                _process = null;
+                if (ReferenceEquals(_loopback, loopback)) { _loopback = null; }
+                _bufferDir = null;
+            }
+        }
+
+        try { process.Dispose(); } catch { }
+        loopback?.Dispose();
+
+        if (wasCurrent)
+        {
+            // Self-exit (not a user Stop): clean up this session's temp dir and notify.
+            TryDeleteDirectory(dir);
+            Stopped?.Invoke(this, EventArgs.Empty);
+        }
+        // If not current, Stop() owns this session's dir deletion.
+    }
+
+    /// <summary>Stops the buffering process and deletes its rolling-segment temp directory.</summary>
     public void Stop()
     {
         Process? process;
         LoopbackCapturePipe? loopback;
+        string? bufferDir;
         lock (_gate)
         {
             process = _process;
             _process = null;
             loopback = _loopback;
             _loopback = null;
+            bufferDir = _bufferDir;
+            _bufferDir = null;
         }
 
         if (process is null)
         {
             loopback?.Dispose();
+            TryDeleteDirectory(bufferDir);
             return;
         }
 
@@ -167,9 +220,10 @@ public sealed class ReplayBufferService
                     // stdin may be closed.
                 }
 
-                if (!process.WaitForExit(5000) && !process.HasExited)
+                if (!process.WaitForExit(4000) && !process.HasExited)
                 {
                     process.Kill(entireProcessTree: true);
+                    try { process.WaitForExit(1500); } catch { }
                 }
             }
         }
@@ -179,8 +233,40 @@ public sealed class ReplayBufferService
         }
         finally
         {
-            process.Dispose();
+            try { process.Dispose(); } catch { }
             loopback?.Dispose();
+            TryDeleteDirectory(bufferDir); // reclaim the rolling .ts segments
+        }
+    }
+
+    /// <summary>Deletes leftover %TEMP%\ClipForge\replay_* dirs from previous (possibly crashed) runs.</summary>
+    public static void CleanupStaleBuffers()
+    {
+        try
+        {
+            var root = Path.Combine(Path.GetTempPath(), "ClipForge");
+            if (!Directory.Exists(root)) return;
+            foreach (var dir in Directory.GetDirectories(root, "replay_*"))
+            {
+                TryDeleteDirectory(dir);
+            }
+        }
+        catch (Exception)
+        {
+            // Best-effort.
+        }
+    }
+
+    private static void TryDeleteDirectory(string? dir)
+    {
+        if (string.IsNullOrEmpty(dir)) return;
+        try
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+        }
+        catch (Exception)
+        {
+            // A segment may still be locked by a dying ffmpeg; the startup sweep will get it next time.
         }
     }
 

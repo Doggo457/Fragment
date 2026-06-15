@@ -68,4 +68,30 @@ public class AppSettings
 
         return Profiles.FirstOrDefault() ?? new RecordingProfile();
     }
+
+    /// <summary>Deep copy, including a fresh clone of each profile. Used so the Settings dialog can
+    /// edit a throwaway copy and only commit it back to the live settings on Save.</summary>
+    public AppSettings Clone()
+    {
+        var copy = (AppSettings)MemberwiseClone();
+        copy.Profiles = Profiles.Select(p => p.Clone()).ToList();
+        return copy;
+    }
+
+    /// <summary>Copies all values from <paramref name="other"/> into this instance (deep for profiles).</summary>
+    public void CopyFrom(AppSettings other)
+    {
+        Profiles = other.Profiles.Select(p => p.Clone()).ToList();
+        ActiveProfileName = other.ActiveProfileName;
+        ReplayBufferEnabled = other.ReplayBufferEnabled;
+        ReplayBufferSeconds = other.ReplayBufferSeconds;
+        ClipLengthSeconds = other.ClipLengthSeconds;
+        RecordHotkey = other.RecordHotkey;
+        ClipHotkey = other.ClipHotkey;
+        ReplayToggleHotkey = other.ReplayToggleHotkey;
+        FfmpegPath = other.FfmpegPath;
+        MinimizeToTray = other.MinimizeToTray;
+        PlaySoundOnClip = other.PlaySoundOnClip;
+        Theme = other.Theme;
+    }
 }

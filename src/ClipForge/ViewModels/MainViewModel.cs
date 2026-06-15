@@ -35,6 +35,7 @@ namespace ClipForge.ViewModels
         private readonly DispatcherTimer _timer;
 
         private bool _isInitializing = true;
+        private bool _disposed;
         private DateTime _recordStartedUtc;
 
         private string _statusText = "Idle";
@@ -80,6 +81,9 @@ namespace ClipForge.ViewModels
         public async System.Threading.Tasks.Task InitializeAsync()
         {
             var progress = new Progress<string>(s => StatusText = s);
+
+            // Reclaim replay-buffer temp dirs left behind by previous (possibly crashed) sessions.
+            ReplayBufferService.CleanupStaleBuffers();
 
             try
             {
@@ -156,12 +160,20 @@ namespace ClipForge.ViewModels
                     // Best-effort; recording still works with system audio only.
                 }
 
+                // The window may have been closed while we were downloading/detecting. Bail so we
+                // don't spawn a recorder/replay-buffer that nothing will ever stop (orphaned ffmpeg).
+                if (_disposed)
+                {
+                    return;
+                }
+
                 _recorder = new ScreenRecorder(_ffmpegPath!);
                 _recorder.Started += OnRecorderStarted;
                 _recorder.Stopped += OnRecorderStopped;
                 _recorder.Error += OnRecorderError;
 
                 _replayBuffer = new ReplayBufferService(_ffmpegPath!);
+                _replayBuffer.Stopped += OnReplayBufferStopped;
 
                 _isInitializing = false;
                 OnPropertyChanged(nameof(RecordButtonText));
@@ -435,11 +447,13 @@ namespace ClipForge.ViewModels
                     window.Owner = owner;
                 }
 
-                window.ShowDialog();
-
-                // Settings may have changed: reload profile list and re-register hotkeys.
-                ReloadProfiles();
-                RegisterHotkeys();
+                // Only apply changes if the user clicked Save (DialogResult == true). On Cancel the
+                // edited copy is discarded, so the live settings/hotkeys are left untouched.
+                if (window.ShowDialog() == true)
+                {
+                    ReloadProfiles();
+                    RegisterHotkeys();
+                }
             }
             catch (Exception ex)
             {
@@ -526,6 +540,21 @@ namespace ClipForge.ViewModels
             Application.Current?.Dispatcher.Invoke(Apply);
         }
 
+        private void OnReplayBufferStopped(object? sender, EventArgs e)
+        {
+            // Fired when the buffer ffmpeg exits on its own (crash / encoder failure), not via Stop().
+            Application.Current?.Dispatcher.Invoke(() =>
+            {
+                if (_disposed) return;
+                IsReplayRunning = false;
+                if (!IsRecording)
+                {
+                    StatusText = "Replay buffer stopped unexpectedly";
+                }
+                RefreshCanExecute();
+            });
+        }
+
         private void OnRecorderError(object? sender, string message)
         {
             void Apply()
@@ -581,7 +610,16 @@ namespace ClipForge.ViewModels
             }
 
             string ext = ScreenRecorder.ContainerExtension(profile.Container);
-            return Path.Combine(profile.OutputFolder, name + ext);
+
+            // Ensure a unique filename so two clips saved in the same second don't overwrite each other.
+            string candidate = Path.Combine(profile.OutputFolder, name + ext);
+            int index = 2;
+            while (File.Exists(candidate))
+            {
+                candidate = Path.Combine(profile.OutputFolder, $"{name}_{index}{ext}");
+                index++;
+            }
+            return candidate;
         }
 
         private void UpdateTimer()
@@ -625,6 +663,7 @@ namespace ClipForge.ViewModels
 
         public void Dispose()
         {
+            _disposed = true; // tells an in-flight InitializeAsync not to spawn services after close
             _timer.Stop();
 
             if (_recorder != null)
@@ -635,13 +674,18 @@ namespace ClipForge.ViewModels
 
                 if (_recorder.IsRecording)
                 {
+                    // Finalize an in-progress recording so the file isn't corrupt.
                     try { _recorder.StopAsync().GetAwaiter().GetResult(); }
                     catch { /* best effort on shutdown */ }
                 }
             }
 
-            try { _replayBuffer?.Stop(); }
-            catch { /* best effort */ }
+            if (_replayBuffer != null)
+            {
+                _replayBuffer.Stopped -= OnReplayBufferStopped;
+                try { _replayBuffer.Stop(); }
+                catch { /* best effort */ }
+            }
 
             _hotkeys.HotkeyPressed -= OnHotkeyPressed;
             _hotkeys.Dispose();
