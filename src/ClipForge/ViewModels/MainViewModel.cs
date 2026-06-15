@@ -1,0 +1,556 @@
+using System;
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Threading;
+using ClipForge.Models;
+using ClipForge.Services;
+using ClipForge.Utils;
+
+namespace ClipForge.ViewModels
+{
+    /// <summary>
+    /// Primary view model for <c>MainWindow</c>. Loads settings, locates FFmpeg, wires the
+    /// recorder / replay-buffer / hotkey services and surfaces commands + observable state
+    /// to the dark-themed main UI.
+    /// </summary>
+    public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
+    {
+        // Hotkey action identifiers. The HotkeyService returns the registration id it
+        // assigned; we map those ids back to logical actions here.
+        private int _recordHotkeyId = -1;
+        private int _clipHotkeyId = -1;
+        private int _replayHotkeyId = -1;
+
+        private readonly AppSettings _settings;
+        private readonly string? _ffmpegPath;
+        private readonly ScreenRecorder? _recorder;
+        private readonly ReplayBufferService? _replayBuffer;
+        private readonly HotkeyService _hotkeys;
+        private readonly DispatcherTimer _timer;
+
+        private DateTime _recordStartedUtc;
+
+        private string _statusText = "Idle";
+        private bool _isRecording;
+        private bool _isReplayRunning;
+        private string _recordTimer = "00:00:00";
+        private string _selectedProfileName = "Default";
+
+        public MainViewModel()
+        {
+            _settings = SettingsService.Load();
+
+            // Locate ffmpeg using the configured path, the bundled copy, then PATH.
+            _ffmpegPath = FfmpegLocator.Find(_settings.FfmpegPath);
+
+            ProfileNames = new ObservableCollection<string>(
+                _settings.Profiles.Select(p => p.Name));
+
+            _selectedProfileName =
+                ProfileNames.Contains(_settings.ActiveProfileName)
+                    ? _settings.ActiveProfileName
+                    : (ProfileNames.FirstOrDefault() ?? "Default");
+
+            if (FfmpegLocator.IsValid(_ffmpegPath))
+            {
+                _recorder = new ScreenRecorder(_ffmpegPath!);
+                _recorder.Started += OnRecorderStarted;
+                _recorder.Stopped += OnRecorderStopped;
+                _recorder.Error += OnRecorderError;
+
+                _replayBuffer = new ReplayBufferService(_ffmpegPath!);
+
+                _statusText = "Idle";
+            }
+            else
+            {
+                _statusText = "FFmpeg not found — set its path in Settings";
+            }
+
+            _hotkeys = new HotkeyService();
+            _hotkeys.HotkeyPressed += OnHotkeyPressed;
+
+            _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
+            _timer.Tick += (_, _) => UpdateTimer();
+
+            StartStopCommand = new RelayCommand(_ => ToggleRecording(), _ => _recorder != null);
+            SaveClipCommand = new RelayCommand(async _ => await SaveClipAsync(),
+                _ => _replayBuffer is { IsRunning: true });
+            ToggleReplayCommand = new RelayCommand(_ => ToggleReplay(), _ => _replayBuffer != null);
+            OpenSettingsCommand = new RelayCommand(_ => OpenSettings());
+            OpenTrimmerCommand = new RelayCommand(_ => OpenTrimmer());
+            OpenOutputFolderCommand = new RelayCommand(_ => OpenOutputFolder());
+
+            // Auto-start the replay buffer if the user has it enabled by default.
+            if (_replayBuffer != null && _settings.ReplayBufferEnabled)
+            {
+                StartReplayBuffer();
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Window / hotkey wiring (called from the code-behind once the HWND exists)
+        // ---------------------------------------------------------------------
+
+        /// <summary>Exposed so the window's WndProc hook can forward messages.</summary>
+        public HotkeyService Hotkeys => _hotkeys;
+
+        /// <summary>
+        /// Invoked by the window once its native handle is available. Initializes the
+        /// hotkey service and registers the configured global hotkeys.
+        /// </summary>
+        public void AttachWindow(IntPtr windowHandle)
+        {
+            _hotkeys.Initialize(windowHandle);
+            RegisterHotkeys();
+        }
+
+        private void RegisterHotkeys()
+        {
+            try
+            {
+                _hotkeys.UnregisterAll();
+
+                var record = HotkeyService.ParseHotkey(_settings.RecordHotkey);
+                _recordHotkeyId = _hotkeys.Register(record.mods, record.vk);
+
+                var clip = HotkeyService.ParseHotkey(_settings.ClipHotkey);
+                _clipHotkeyId = _hotkeys.Register(clip.mods, clip.vk);
+
+                var replay = HotkeyService.ParseHotkey(_settings.ReplayToggleHotkey);
+                _replayHotkeyId = _hotkeys.Register(replay.mods, replay.vk);
+            }
+            catch (Exception ex)
+            {
+                StatusText = $"Hotkey registration failed: {ex.Message}";
+            }
+        }
+
+        private void OnHotkeyPressed(int id)
+        {
+            // Marshal onto the UI thread just in case the service raises on another thread.
+            void Dispatch(Action a) =>
+                Application.Current?.Dispatcher.Invoke(a);
+
+            if (id == _recordHotkeyId)
+            {
+                Dispatch(ToggleRecording);
+            }
+            else if (id == _clipHotkeyId)
+            {
+                Dispatch(async () => await SaveClipAsync());
+            }
+            else if (id == _replayHotkeyId)
+            {
+                Dispatch(ToggleReplay);
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Bindable properties
+        // ---------------------------------------------------------------------
+
+        public ObservableCollection<string> ProfileNames { get; }
+
+        public string SelectedProfileName
+        {
+            get => _selectedProfileName;
+            set
+            {
+                if (SetField(ref _selectedProfileName, value) && !string.IsNullOrEmpty(value))
+                {
+                    _settings.ActiveProfileName = value;
+                    SettingsService.Save(_settings);
+                }
+            }
+        }
+
+        public string StatusText
+        {
+            get => _statusText;
+            private set => SetField(ref _statusText, value);
+        }
+
+        public bool IsRecording
+        {
+            get => _isRecording;
+            private set
+            {
+                if (SetField(ref _isRecording, value))
+                {
+                    OnPropertyChanged(nameof(RecordButtonText));
+                }
+            }
+        }
+
+        public bool IsReplayRunning
+        {
+            get => _isReplayRunning;
+            private set
+            {
+                if (SetField(ref _isReplayRunning, value))
+                {
+                    OnPropertyChanged(nameof(ReplayStateText));
+                }
+            }
+        }
+
+        public string RecordTimer
+        {
+            get => _recordTimer;
+            private set => SetField(ref _recordTimer, value);
+        }
+
+        /// <summary>Label for the large record button.</summary>
+        public string RecordButtonText => IsRecording ? "Stop" : "Record";
+
+        /// <summary>Secondary label on the replay toggle.</summary>
+        public string ReplayStateText => IsReplayRunning ? "(On)" : "(Off)";
+
+        // ---------------------------------------------------------------------
+        // Commands
+        // ---------------------------------------------------------------------
+
+        public ICommand StartStopCommand { get; }
+        public ICommand SaveClipCommand { get; }
+        public ICommand ToggleReplayCommand { get; }
+        public ICommand OpenSettingsCommand { get; }
+        public ICommand OpenTrimmerCommand { get; }
+        public ICommand OpenOutputFolderCommand { get; }
+
+        // ---------------------------------------------------------------------
+        // Command implementations
+        // ---------------------------------------------------------------------
+
+        private async void ToggleRecording()
+        {
+            if (_recorder == null)
+            {
+                StatusText = "FFmpeg not found — set its path in Settings";
+                return;
+            }
+
+            try
+            {
+                if (_recorder.IsRecording)
+                {
+                    StatusText = "Stopping...";
+                    await _recorder.StopAsync();
+                }
+                else
+                {
+                    StatusText = "Starting...";
+                    await _recorder.StartAsync(ActiveProfile());
+                }
+            }
+            catch (Exception ex)
+            {
+                StatusText = $"Error: {ex.Message}";
+            }
+
+            RefreshCanExecute();
+        }
+
+        private async System.Threading.Tasks.Task SaveClipAsync()
+        {
+            if (_replayBuffer is not { IsRunning: true })
+            {
+                StatusText = "Replay buffer is not running";
+                return;
+            }
+
+            try
+            {
+                StatusText = "Saving clip...";
+                var profile = ActiveProfile();
+                string outputPath = BuildOutputPath(profile, "Clip");
+
+                string? saved = await _replayBuffer.SaveClipAsync(
+                    _settings.ClipLengthSeconds, outputPath);
+
+                StatusText = saved != null
+                    ? $"Saved clip: {Path.GetFileName(saved)}"
+                    : "Failed to save clip";
+            }
+            catch (Exception ex)
+            {
+                StatusText = $"Clip error: {ex.Message}";
+            }
+        }
+
+        private void ToggleReplay()
+        {
+            if (_replayBuffer == null)
+            {
+                StatusText = "FFmpeg not found — set its path in Settings";
+                return;
+            }
+
+            try
+            {
+                if (_replayBuffer.IsRunning)
+                {
+                    _replayBuffer.Stop();
+                    IsReplayRunning = false;
+                    StatusText = "Replay buffer stopped";
+                }
+                else
+                {
+                    StartReplayBuffer();
+                }
+            }
+            catch (Exception ex)
+            {
+                StatusText = $"Replay error: {ex.Message}";
+            }
+
+            RefreshCanExecute();
+        }
+
+        private void StartReplayBuffer()
+        {
+            if (_replayBuffer == null)
+            {
+                return;
+            }
+
+            try
+            {
+                _replayBuffer.Start(ActiveProfile(), _settings.ReplayBufferSeconds);
+                IsReplayRunning = _replayBuffer.IsRunning;
+                StatusText = IsReplayRunning ? "Replay buffer running" : StatusText;
+            }
+            catch (Exception ex)
+            {
+                IsReplayRunning = false;
+                StatusText = $"Replay error: {ex.Message}";
+            }
+
+            RefreshCanExecute();
+        }
+
+        private void OpenSettings()
+        {
+            try
+            {
+                var vm = new SettingsViewModel(_settings);
+                var window = new Views.SettingsWindow(vm);
+
+                if (Application.Current?.MainWindow is { } owner && !ReferenceEquals(owner, window))
+                {
+                    window.Owner = owner;
+                }
+
+                window.ShowDialog();
+
+                // Settings may have changed: reload profile list and re-register hotkeys.
+                ReloadProfiles();
+                RegisterHotkeys();
+            }
+            catch (Exception ex)
+            {
+                StatusText = $"Settings error: {ex.Message}";
+            }
+        }
+
+        private void OpenTrimmer()
+        {
+            try
+            {
+                var window = new Views.TrimmerWindow();
+
+                if (Application.Current?.MainWindow is { } owner && !ReferenceEquals(owner, window))
+                {
+                    window.Owner = owner;
+                }
+
+                window.ShowDialog();
+            }
+            catch (Exception ex)
+            {
+                StatusText = $"Trimmer error: {ex.Message}";
+            }
+        }
+
+        private void OpenOutputFolder()
+        {
+            try
+            {
+                string folder = ActiveProfile().OutputFolder;
+                Directory.CreateDirectory(folder);
+
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = folder,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                StatusText = $"Could not open folder: {ex.Message}";
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // Recorder event handlers
+        // ---------------------------------------------------------------------
+
+        private void OnRecorderStarted(object? sender, EventArgs e)
+        {
+            void Apply()
+            {
+                IsRecording = true;
+                _recordStartedUtc = DateTime.UtcNow;
+                RecordTimer = "00:00:00";
+                _timer.Start();
+                StatusText = "Recording";
+                RefreshCanExecute();
+            }
+
+            Application.Current?.Dispatcher.Invoke(Apply);
+        }
+
+        private void OnRecorderStopped(object? sender, string outputPath)
+        {
+            void Apply()
+            {
+                IsRecording = false;
+                _timer.Stop();
+                UpdateTimer();
+                StatusText = string.IsNullOrEmpty(outputPath)
+                    ? "Stopped"
+                    : $"Saved: {Path.GetFileName(outputPath)}";
+                RefreshCanExecute();
+            }
+
+            Application.Current?.Dispatcher.Invoke(Apply);
+        }
+
+        private void OnRecorderError(object? sender, string message)
+        {
+            void Apply()
+            {
+                IsRecording = false;
+                _timer.Stop();
+                StatusText = $"Error: {message}";
+                RefreshCanExecute();
+            }
+
+            Application.Current?.Dispatcher.Invoke(Apply);
+        }
+
+        // ---------------------------------------------------------------------
+        // Helpers
+        // ---------------------------------------------------------------------
+
+        private RecordingProfile ActiveProfile()
+        {
+            return _settings.Profiles.FirstOrDefault(
+                       p => string.Equals(p.Name, SelectedProfileName, StringComparison.Ordinal))
+                   ?? _settings.ActiveProfile();
+        }
+
+        private void ReloadProfiles()
+        {
+            string previous = SelectedProfileName;
+
+            ProfileNames.Clear();
+            foreach (var p in _settings.Profiles)
+            {
+                ProfileNames.Add(p.Name);
+            }
+
+            _selectedProfileName = ProfileNames.Contains(previous)
+                ? previous
+                : (ProfileNames.FirstOrDefault() ?? "Default");
+            OnPropertyChanged(nameof(SelectedProfileName));
+        }
+
+        private static string BuildOutputPath(RecordingProfile profile, string suffix)
+        {
+            Directory.CreateDirectory(profile.OutputFolder);
+
+            DateTime now = DateTime.Now;
+            string name = profile.FileNameTemplate
+                .Replace("{date}", now.ToString("yyyy-MM-dd"))
+                .Replace("{time}", now.ToString("HH-mm-ss"));
+
+            if (!string.IsNullOrEmpty(suffix))
+            {
+                name += "_" + suffix;
+            }
+
+            string ext = ScreenRecorder.ContainerExtension(profile.Container);
+            return Path.Combine(profile.OutputFolder, name + ext);
+        }
+
+        private void UpdateTimer()
+        {
+            if (!IsRecording)
+            {
+                return;
+            }
+
+            TimeSpan elapsed = DateTime.UtcNow - _recordStartedUtc;
+            RecordTimer = elapsed.ToString(@"hh\:mm\:ss");
+        }
+
+        private void RefreshCanExecute()
+        {
+            (StartStopCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (SaveClipCommand as RelayCommand)?.RaiseCanExecuteChanged();
+            (ToggleReplayCommand as RelayCommand)?.RaiseCanExecuteChanged();
+        }
+
+        // ---------------------------------------------------------------------
+        // INotifyPropertyChanged
+        // ---------------------------------------------------------------------
+
+        public event PropertyChangedEventHandler? PropertyChanged;
+
+        private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
+            => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+
+        private bool SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
+        {
+            if (Equals(field, value))
+            {
+                return false;
+            }
+
+            field = value;
+            OnPropertyChanged(propertyName);
+            return true;
+        }
+
+        public void Dispose()
+        {
+            _timer.Stop();
+
+            if (_recorder != null)
+            {
+                _recorder.Started -= OnRecorderStarted;
+                _recorder.Stopped -= OnRecorderStopped;
+                _recorder.Error -= OnRecorderError;
+
+                if (_recorder.IsRecording)
+                {
+                    try { _recorder.StopAsync().GetAwaiter().GetResult(); }
+                    catch { /* best effort on shutdown */ }
+                }
+            }
+
+            try { _replayBuffer?.Stop(); }
+            catch { /* best effort */ }
+
+            _hotkeys.HotkeyPressed -= OnHotkeyPressed;
+            _hotkeys.Dispose();
+        }
+    }
+}

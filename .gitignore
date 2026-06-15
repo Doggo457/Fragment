@@ -1,0 +1,81 @@
+## ----------------------------------------------------------------------------
+## ClipForge .gitignore  (Visual Studio / .NET / Rider)
+## ----------------------------------------------------------------------------
+
+# Build output
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Ll]og/
+[Ll]ogs/
+publish/
+artifacts/
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.userprefs
+*.userosscache
+*.sln.docstates
+*.VC.db
+*.VC.VC.opendb
+
+# Rider / JetBrains
+.idea/
+*.sln.iml
+*.DotSettings.user
+
+# Visual Studio Code
+.vscode/
+
+# .NET / MSBuild
+project.lock.json
+project.fragment.lock.json
+*.binlog
+*.nupkg
+*.snupkg
+msbuild.log
+msbuild.err
+msbuild.wrn
+
+# Test / coverage
+[Tt]est[Rr]esult*/
+coverage*.json
+coverage*.xml
+coverage*.info
+*.coverage
+*.coveragexml
+
+# Roslyn cache
+.roslyn/
+
+# ----------------------------------------------------------------------------
+# ClipForge-specific
+# ----------------------------------------------------------------------------
+
+# Bundled FFmpeg binaries are distributed separately, not committed
+/ffmpeg/*.exe
+/ffmpeg/*.dll
+src/ClipForge/ffmpeg/*.exe
+src/ClipForge/ffmpeg/*.dll
+**/ffmpeg/ffmpeg.exe
+**/ffmpeg/ffprobe.exe
+
+# Recorded clips / output media
+clips/
+[Oo]utput/
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.gif
+
+# Local settings dumps
+settings.local.json
+
+# OS cruft
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
