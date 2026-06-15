@@ -8,7 +8,8 @@
         WindowStartupLocation="CenterOwner"
         Background="{StaticResource WindowBackgroundBrush}"
         Foreground="{StaticResource ForegroundBrush}"
-        FontFamily="Segoe UI" FontSize="13">
+        FontFamily="Segoe UI" FontSize="13"
+        AllowDrop="True" PreviewDragOver="OnDragOver" PreviewDrop="OnDrop">
 
     <Window.Resources>
         <Style x:Key="LabelText" TargetType="TextBlock">
@@ -90,7 +91,7 @@
                                   MediaFailed="OnMediaFailed"
                                   MediaEnded="OnMediaEnded"/>
                     <TextBlock x:Name="PreviewHint"
-                               Text="Open a video to preview and trim it"
+                               Text="Open a video to preview and trim it — or drag &amp; drop a file here"
                                Foreground="{StaticResource SubtleForegroundBrush}"
                                HorizontalAlignment="Center" VerticalAlignment="Center"/>
                 </Grid>

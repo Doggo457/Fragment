@@ -63,6 +63,33 @@ public partial class TrimmerWindow : Window
         }
     }
 
+    // ----------------------------------------------------------------- drag & drop
+    private void OnDragOver(object sender, DragEventArgs e)
+    {
+        e.Effects = HasDroppableFile(e) ? DragDropEffects.Copy : DragDropEffects.None;
+        e.Handled = true;
+    }
+
+    private void OnDrop(object sender, DragEventArgs e)
+    {
+        e.Handled = true;
+        if (!e.Data.GetDataPresent(DataFormats.FileDrop)) return;
+        if (e.Data.GetData(DataFormats.FileDrop) is string[] files)
+        {
+            var file = Array.Find(files, File.Exists);
+            if (file is not null)
+            {
+                LoadMedia(file);
+            }
+        }
+    }
+
+    private static bool HasDroppableFile(DragEventArgs e)
+    {
+        if (!e.Data.GetDataPresent(DataFormats.FileDrop)) return false;
+        return e.Data.GetData(DataFormats.FileDrop) is string[] files && Array.Exists(files, File.Exists);
+    }
+
     private void LoadMedia(string path)
     {
         _inputPath = path;
