@@ -27,7 +27,7 @@ namespace ClipForge
             Closed += OnClosed;
         }
 
-        private void OnLoaded(object sender, RoutedEventArgs e)
+        private async void OnLoaded(object sender, RoutedEventArgs e)
         {
             // Obtain the native window handle and attach a message hook so the
             // HotkeyService can receive WM_HOTKEY messages.
@@ -39,6 +39,9 @@ namespace ClipForge
 
             // Hand the validated handle to the view model so it can register hotkeys.
             _viewModel.AttachWindow(handle);
+
+            // Provision FFmpeg (downloading on first run) and enable recording.
+            await _viewModel.InitializeAsync();
         }
 
         /// <summary>

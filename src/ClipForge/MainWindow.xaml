@@ -107,12 +107,6 @@
             <Setter Property="Margin" Value="2,0,0,4" />
         </Style>
 
-        <Style TargetType="ComboBox">
-            <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}" />
-            <Setter Property="Background" Value="{DynamicResource PanelBackgroundBrush}" />
-            <Setter Property="Padding" Value="8,6" />
-            <Setter Property="FontSize" Value="13" />
-        </Style>
     </Window.Resources>
 
     <Grid Margin="20">

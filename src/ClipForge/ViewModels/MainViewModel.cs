@@ -28,12 +28,13 @@ namespace ClipForge.ViewModels
         private int _replayHotkeyId = -1;
 
         private readonly AppSettings _settings;
-        private readonly string? _ffmpegPath;
-        private readonly ScreenRecorder? _recorder;
-        private readonly ReplayBufferService? _replayBuffer;
+        private string? _ffmpegPath;
+        private ScreenRecorder? _recorder;
+        private ReplayBufferService? _replayBuffer;
         private readonly HotkeyService _hotkeys;
         private readonly DispatcherTimer _timer;
 
+        private bool _isInitializing = true;
         private DateTime _recordStartedUtc;
 
         private string _statusText = "Idle";
@@ -46,9 +47,6 @@ namespace ClipForge.ViewModels
         {
             _settings = SettingsService.Load();
 
-            // Locate ffmpeg using the configured path, the bundled copy, then PATH.
-            _ffmpegPath = FfmpegLocator.Find(_settings.FfmpegPath);
-
             ProfileNames = new ObservableCollection<string>(
                 _settings.Profiles.Select(p => p.Name));
 
@@ -57,21 +55,7 @@ namespace ClipForge.ViewModels
                     ? _settings.ActiveProfileName
                     : (ProfileNames.FirstOrDefault() ?? "Default");
 
-            if (FfmpegLocator.IsValid(_ffmpegPath))
-            {
-                _recorder = new ScreenRecorder(_ffmpegPath!);
-                _recorder.Started += OnRecorderStarted;
-                _recorder.Stopped += OnRecorderStopped;
-                _recorder.Error += OnRecorderError;
-
-                _replayBuffer = new ReplayBufferService(_ffmpegPath!);
-
-                _statusText = "Idle";
-            }
-            else
-            {
-                _statusText = "FFmpeg not found — set its path in Settings";
-            }
+            _statusText = "Starting up…";
 
             _hotkeys = new HotkeyService();
             _hotkeys.HotkeyPressed += OnHotkeyPressed;
@@ -79,19 +63,65 @@ namespace ClipForge.ViewModels
             _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
             _timer.Tick += (_, _) => UpdateTimer();
 
-            StartStopCommand = new RelayCommand(_ => ToggleRecording(), _ => _recorder != null);
+            StartStopCommand = new RelayCommand(_ => ToggleRecording(), _ => _recorder != null && !_isInitializing);
             SaveClipCommand = new RelayCommand(async _ => await SaveClipAsync(),
                 _ => _replayBuffer is { IsRunning: true });
             ToggleReplayCommand = new RelayCommand(_ => ToggleReplay(), _ => _replayBuffer != null);
             OpenSettingsCommand = new RelayCommand(_ => OpenSettings());
             OpenTrimmerCommand = new RelayCommand(_ => OpenTrimmer());
             OpenOutputFolderCommand = new RelayCommand(_ => OpenOutputFolder());
+        }
 
-            // Auto-start the replay buffer if the user has it enabled by default.
-            if (_replayBuffer != null && _settings.ReplayBufferEnabled)
+        /// <summary>
+        /// Ensures FFmpeg is available (downloading it on first run if needed), wires up the
+        /// recorder + replay-buffer services and auto-starts the replay buffer. Called once the
+        /// window has loaded so ClipForge is "launch and record" out of the box.
+        /// </summary>
+        public async System.Threading.Tasks.Task InitializeAsync()
+        {
+            var progress = new Progress<string>(s => StatusText = s);
+
+            try
             {
-                StartReplayBuffer();
+                _ffmpegPath = await FfmpegProvider.EnsureAsync(_settings.FfmpegPath, progress);
             }
+            catch (Exception ex)
+            {
+                StatusText = $"FFmpeg setup failed: {ex.Message}";
+            }
+
+            if (FfmpegLocator.IsValid(_ffmpegPath))
+            {
+                if (!string.Equals(_settings.FfmpegPath, _ffmpegPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    _settings.FfmpegPath = _ffmpegPath;
+                    SettingsService.Save(_settings);
+                }
+
+                _recorder = new ScreenRecorder(_ffmpegPath!);
+                _recorder.Started += OnRecorderStarted;
+                _recorder.Stopped += OnRecorderStopped;
+                _recorder.Error += OnRecorderError;
+
+                _replayBuffer = new ReplayBufferService(_ffmpegPath!);
+
+                _isInitializing = false;
+                OnPropertyChanged(nameof(RecordButtonText));
+                StatusText = "Ready — press Record";
+
+                if (_settings.ReplayBufferEnabled)
+                {
+                    StartReplayBuffer();
+                }
+            }
+            else
+            {
+                _isInitializing = false;
+                OnPropertyChanged(nameof(RecordButtonText));
+                StatusText = "FFmpeg unavailable — set its path in Settings";
+            }
+
+            RefreshCanExecute();
         }
 
         // ---------------------------------------------------------------------
@@ -208,7 +238,7 @@ namespace ClipForge.ViewModels
         }
 
         /// <summary>Label for the large record button.</summary>
-        public string RecordButtonText => IsRecording ? "Stop" : "Record";
+        public string RecordButtonText => _isInitializing ? "Setting up…" : (IsRecording ? "Stop" : "Record");
 
         /// <summary>Secondary label on the replay toggle.</summary>
         public string ReplayStateText => IsReplayRunning ? "(On)" : "(Off)";
