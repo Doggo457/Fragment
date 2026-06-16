@@ -45,6 +45,9 @@ public sealed class ScreenRecorder
     /// <summary>The absolute path of the file currently being written, or null when idle.</summary>
     public string? CurrentOutputPath { get; private set; }
 
+    /// <summary>True if the most recent start used GPU Desktop Duplication (vs the gdigrab fallback).</summary>
+    public bool LastCaptureUsedDesktopDuplication { get; private set; }
+
     /// <summary>Raised once the ffmpeg process has been launched.</summary>
     public event EventHandler? Started;
 
@@ -57,7 +60,7 @@ public sealed class ScreenRecorder
     /// <summary>
     /// Builds the output path, constructs the ffmpeg command line and launches the capture process.
     /// </summary>
-    public Task StartAsync(RecordingProfile profile)
+    public async Task StartAsync(RecordingProfile profile)
     {
         if (profile is null)
         {
@@ -71,6 +74,13 @@ public sealed class ScreenRecorder
                 throw new InvalidOperationException("A recording is already in progress.");
             }
         }
+
+        // Pick the capture backend: GPU Desktop Duplication when it can actually capture right now,
+        // otherwise the gdigrab compatibility path (so an exclusive-fullscreen game records normally
+        // instead of producing a black screen). The probe is ~0.2s, so run it off the UI thread.
+        bool useDda = CanUseDesktopDuplication(profile)
+                      && await Task.Run(() => CaptureProbe.IsDesktopDuplicationWorking(_ffmpegPath));
+        LastCaptureUsedDesktopDuplication = useDda;
 
         string outputPath;
         string arguments;
@@ -99,14 +109,14 @@ public sealed class ScreenRecorder
                 }
             }
 
-            arguments = BuildArgumentsCore(profile, outputPath, loopbackInfo);
+            arguments = BuildArgumentsCore(profile, outputPath, loopbackInfo, useDda);
         }
         catch (Exception ex)
         {
             _loopback?.Dispose();
             _loopback = null;
             Error?.Invoke(this, $"Failed to prepare recording: {ex.Message}");
-            return Task.CompletedTask;
+            return;
         }
 
         var startInfo = new ProcessStartInfo
@@ -142,7 +152,7 @@ public sealed class ScreenRecorder
                 process.Dispose();
                 sessionLoopback?.Dispose();
                 Error?.Invoke(this, "ffmpeg process failed to start.");
-                return Task.CompletedTask;
+                return;
             }
 
             ChildProcessTracker.Track(process); // dies with Fragment no matter how it exits
@@ -155,11 +165,11 @@ public sealed class ScreenRecorder
             try { process.Dispose(); } catch { }
             sessionLoopback?.Dispose();
             Error?.Invoke(this, $"Unable to launch ffmpeg: {ex.Message}");
-            return Task.CompletedTask;
+            return;
         }
 
         Started?.Invoke(this, EventArgs.Empty);
-        return Task.CompletedTask;
+        return;
     }
 
     /// <summary>
@@ -292,9 +302,18 @@ public sealed class ScreenRecorder
     /// Exposed for unit testing.
     /// </summary>
     public static string BuildArguments(RecordingProfile profile, string outputPath)
-        => BuildArgumentsCore(profile, outputPath, null);
+        => BuildArgumentsCore(profile, outputPath, null, CanUseDesktopDuplication(profile));
 
-    internal static string BuildArgumentsCore(RecordingProfile profile, string outputPath, LoopbackInfo? loopback)
+    /// <summary>
+    /// Whether this profile is a candidate for GPU Desktop Duplication capture. Window-by-title and
+    /// the GIF pipeline have no ddagrab path; everything else (full-screen / region) can use it if a
+    /// runtime probe says it's available.
+    /// </summary>
+    internal static bool CanUseDesktopDuplication(RecordingProfile profile)
+        => profile.Container != OutputContainer.Gif
+           && profile.Source is CaptureSource.FullScreen or CaptureSource.Region;
+
+    internal static string BuildArgumentsCore(RecordingProfile profile, string outputPath, LoopbackInfo? loopback, bool useDda)
     {
         if (profile is null)
         {
@@ -312,14 +331,14 @@ public sealed class ScreenRecorder
         sb.Append("-hide_banner -loglevel error -y");
 
         // ---- Video input (ddagrab GPU capture for full-screen/region, gdigrab otherwise) ----
-        bool usesDda = AppendVideoInput(sb, profile);
+        AppendVideoInput(sb, profile, useDda);
 
         // ---- Audio inputs (WASAPI loopback pipe and/or dshow), if any ----
         // GIF output carries no audio, so don't declare audio inputs that would go unmapped.
         var audioInputs = profile.Container == OutputContainer.Gif ? 0 : AppendAudioInputs(sb, profile, loopback);
 
         // ---- Encoding / mapping ----
-        AppendEncoding(sb, profile, audioInputs, usesDda);
+        AppendEncoding(sb, profile, audioInputs, useDda);
 
         // ---- Output ----
         sb.Append(' ').Append(Quote(outputPath));
@@ -330,20 +349,22 @@ public sealed class ScreenRecorder
     /// <summary>
     /// Appends the gdigrab video input. Handles full-screen, monitor offset, region and window-title capture.
     /// </summary>
-    /// <returns><c>true</c> if the Desktop Duplication (ddagrab) GPU source was used.</returns>
-    private static bool AppendVideoInput(StringBuilder sb, RecordingProfile profile)
+    /// <summary>
+    /// Appends the video input. When <paramref name="useDda"/> is true, GPU Desktop Duplication
+    /// (ddagrab) is used (smooth, high-refresh, full-screen/region only); otherwise the gdigrab GDI
+    /// path is used, which also serves as the compatibility fallback for any source.
+    /// </summary>
+    private static void AppendVideoInput(StringBuilder sb, RecordingProfile profile, bool useDda)
     {
         var fps = profile.Fps > 0 ? profile.Fps : 60;
 
-        // ddagrab (Desktop Duplication) for full-screen and region: it is GPU-based and can capture
-        // at the monitor's true refresh rate. gdigrab is a CPU GDI BitBlt poll that caps near 60fps,
-        // so it can never match a high-refresh display. Window-by-title and the GIF pipeline have no
-        // ddagrab path, so they stay on gdigrab.
-        if (profile.Container != OutputContainer.Gif &&
-            profile.Source is CaptureSource.FullScreen or CaptureSource.Region)
+        // ddagrab is GPU-based and can capture at the monitor's true refresh rate; gdigrab is a CPU
+        // GDI BitBlt poll that caps near 60fps. The caller decides which (gdigrab when a probe shows
+        // Desktop Duplication is blocked, e.g. an exclusive-fullscreen game).
+        if (useDda)
         {
             AppendDdaInput(sb, profile, fps);
-            return true;
+            return;
         }
 
         sb.Append(" -f gdigrab");
@@ -382,8 +403,6 @@ public sealed class ScreenRecorder
                 AppendPrimaryFullScreen(sb);
                 break;
         }
-
-        return false;
     }
 
     /// <summary>

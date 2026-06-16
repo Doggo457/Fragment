@@ -522,7 +522,12 @@ namespace Fragment.ViewModels
                 _recordStartedUtc = DateTime.UtcNow;
                 RecordTimer = "00:00:00";
                 _timer.Start();
-                StatusText = "Recording";
+                // Tell the user when Desktop Duplication was unavailable (e.g. an exclusive-fullscreen
+                // game) and we fell back to the ~60fps gdigrab path, so a non-smooth result isn't a mystery.
+                StatusText = (_recorder is { LastCaptureUsedDesktopDuplication: false }
+                              && ActiveProfile().Source is CaptureSource.FullScreen or CaptureSource.Region)
+                    ? "Recording (compatibility mode — capture at refresh rate unavailable)"
+                    : "Recording";
                 RefreshCanExecute();
             }
 

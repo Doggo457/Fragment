@@ -32,6 +32,8 @@ public sealed class ReplayBufferService
     private string? _bufferDir;
     private RecordingProfile? _profile;
     private LoopbackCapturePipe? _loopback;
+    private int _bufferSeconds;
+    private bool _ddaFallbackDone; // ensures the GPU->gdigrab auto-fallback only fires once per user start
 
     public ReplayBufferService(string ffmpegPath)
     {
@@ -61,6 +63,13 @@ public sealed class ReplayBufferService
     /// </summary>
     public void Start(RecordingProfile profile, int bufferSeconds)
     {
+        // A fresh user-initiated start re-arms the one-shot GPU->gdigrab fallback.
+        _ddaFallbackDone = false;
+        StartInternal(profile, bufferSeconds, preferDda: true);
+    }
+
+    private void StartInternal(RecordingProfile profile, int bufferSeconds, bool preferDda)
+    {
         if (profile is null)
         {
             throw new ArgumentNullException(nameof(profile));
@@ -78,6 +87,12 @@ public sealed class ReplayBufferService
                 throw new InvalidOperationException("Replay buffer is already running.");
             }
         }
+
+        // GPU Desktop Duplication when it can capture right now; otherwise gdigrab (so the buffer
+        // keeps recording an exclusive-fullscreen game instead of going black).
+        bool useDda = preferDda
+                      && ScreenRecorder.CanUseDesktopDuplication(profile)
+                      && CaptureProbe.IsDesktopDuplicationWorking(_ffmpegPath);
 
         var bufferDir = CreateBufferDirectory();
         var wrap = ComputeSegmentWrap(bufferSeconds);
@@ -101,7 +116,7 @@ public sealed class ReplayBufferService
             }
         }
 
-        var arguments = BuildBufferArguments(profile, bufferDir, wrap, loopbackInfo);
+        var arguments = BuildBufferArguments(profile, bufferDir, wrap, loopbackInfo, useDda);
 
         var startInfo = new ProcessStartInfo
         {
@@ -116,7 +131,7 @@ public sealed class ReplayBufferService
 
         var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
         var sessionLoopback = _loopback;
-        process.Exited += (_, _) => OnBufferExited(process, sessionLoopback, bufferDir);
+        process.Exited += (_, _) => OnBufferExited(process, sessionLoopback, bufferDir, profile, bufferSeconds, useDda);
 
         // Publish under the lock before Start() so an instant exit's handler sees this session.
         lock (_gate)
@@ -124,6 +139,7 @@ public sealed class ReplayBufferService
             _process = process;
             _bufferDir = bufferDir;
             _profile = profile;
+            _bufferSeconds = bufferSeconds;
         }
 
         try
@@ -157,7 +173,8 @@ public sealed class ReplayBufferService
     public event EventHandler? Stopped;
 
     // Bound to a specific session; disposes only that session's own resources.
-    private void OnBufferExited(Process process, LoopbackCapturePipe? loopback, string? dir)
+    private void OnBufferExited(Process process, LoopbackCapturePipe? loopback, string? dir,
+                               RecordingProfile profile, int bufferSeconds, bool sessionUsedDda)
     {
         bool wasCurrent;
         lock (_gate)
@@ -174,13 +191,30 @@ public sealed class ReplayBufferService
         try { process.Dispose(); } catch { }
         loopback?.Dispose();
 
-        if (wasCurrent)
+        if (!wasCurrent)
         {
-            // Self-exit (not a user Stop): clean up this session's temp dir and notify.
-            TryDeleteDirectory(dir);
-            Stopped?.Invoke(this, EventArgs.Empty);
+            // A superseded session; Stop() owns its dir deletion.
+            return;
         }
-        // If not current, Stop() owns this session's dir deletion.
+
+        // Self-exit (not a user Stop): clean up this session's temp dir.
+        TryDeleteDirectory(dir);
+
+        // If a GPU Desktop Duplication session died on its own (e.g. a game grabbed the display in
+        // exclusive fullscreen), transparently restart the buffer on gdigrab so instant replay keeps
+        // working instead of silently stopping. One-shot, to avoid restart loops.
+        if (sessionUsedDda && !_ddaFallbackDone)
+        {
+            _ddaFallbackDone = true;
+            Task.Run(() =>
+            {
+                try { StartInternal(profile, bufferSeconds, preferDda: false); }
+                catch { Stopped?.Invoke(this, EventArgs.Empty); }
+            });
+            return;
+        }
+
+        Stopped?.Invoke(this, EventArgs.Empty);
     }
 
     /// <summary>Stops the buffering process and deletes its rolling-segment temp directory.</summary>
@@ -372,13 +406,13 @@ public sealed class ReplayBufferService
     /// Builds the segment-muxer command: capture the screen (and audio) and write a rolling ring of
     /// fixed-length .ts segments. <c>-segment_wrap</c> caps the number of files on disk.
     /// </summary>
-    private static string BuildBufferArguments(RecordingProfile profile, string bufferDir, int wrap, LoopbackInfo? loopback)
+    private static string BuildBufferArguments(RecordingProfile profile, string bufferDir, int wrap, LoopbackInfo? loopback, bool useDda)
     {
         var sb = new StringBuilder();
         sb.Append("-hide_banner -loglevel error -y");
 
         // Reuse the recorder's input + encoding logic by building the capture portion here.
-        AppendCapture(sb, profile, loopback);
+        AppendCapture(sb, profile, loopback, useDda);
 
         // Segment muxer: rolling, wrapping, fixed-duration TS files. reset_timestamps keeps each
         // segment independently playable / concatenatable.
@@ -422,13 +456,9 @@ public sealed class ReplayBufferService
     /// Audio (when present) is mixed/mapped; output is forced to a TS-friendly codec set
     /// (H.264 + AAC) so segments concatenate cleanly regardless of profile container.
     /// </summary>
-    private static void AppendCapture(StringBuilder sb, RecordingProfile profile, LoopbackInfo? loopback)
+    private static void AppendCapture(StringBuilder sb, RecordingProfile profile, LoopbackInfo? loopback, bool usesDda)
     {
         var fps = profile.Fps > 0 ? profile.Fps : 60;
-
-        // ddagrab (Desktop Duplication) GPU capture for full-screen/region can hit the monitor's true
-        // refresh rate; gdigrab (CPU BitBlt) caps near 60fps. Window/monitor-by-index stay on gdigrab.
-        bool usesDda = profile.Source is CaptureSource.FullScreen or CaptureSource.Region;
 
         // ---- Video input ----
         if (usesDda)
