@@ -32,8 +32,9 @@ public sealed class ReplayBufferService
     private string? _bufferDir;
     private RecordingProfile? _profile;
     private LoopbackCapturePipe? _loopback;
-    private int _bufferSeconds;
-    private bool _ddaFallbackDone; // ensures the GPU->gdigrab auto-fallback only fires once per user start
+
+    /// <summary>True if the current/last buffer session captured via GPU Desktop Duplication.</summary>
+    public bool LastSessionUsedDesktopDuplication { get; private set; }
 
     public ReplayBufferService(string ffmpegPath)
     {
@@ -61,14 +62,7 @@ public sealed class ReplayBufferService
     /// Starts continuous segmented recording into a fresh temp directory. The number of retained
     /// segments is sized to cover at least <paramref name="bufferSeconds"/> seconds.
     /// </summary>
-    public void Start(RecordingProfile profile, int bufferSeconds)
-    {
-        // A fresh user-initiated start re-arms the one-shot GPU->gdigrab fallback.
-        _ddaFallbackDone = false;
-        StartInternal(profile, bufferSeconds, preferDda: true);
-    }
-
-    private void StartInternal(RecordingProfile profile, int bufferSeconds, bool preferDda)
+    public void Start(RecordingProfile profile, int bufferSeconds, bool allowDesktopDuplication = true)
     {
         if (profile is null)
         {
@@ -89,10 +83,12 @@ public sealed class ReplayBufferService
         }
 
         // GPU Desktop Duplication when it can capture right now; otherwise gdigrab (so the buffer
-        // keeps recording an exclusive-fullscreen game instead of going black).
-        bool useDda = preferDda
+        // keeps recording an exclusive-fullscreen game instead of going black). The caller can force
+        // gdigrab (allowDesktopDuplication=false) when restarting after a GPU session was blocked.
+        bool useDda = allowDesktopDuplication
                       && ScreenRecorder.CanUseDesktopDuplication(profile)
                       && CaptureProbe.IsDesktopDuplicationWorking(_ffmpegPath);
+        LastSessionUsedDesktopDuplication = useDda;
 
         var bufferDir = CreateBufferDirectory();
         var wrap = ComputeSegmentWrap(bufferSeconds);
@@ -131,7 +127,7 @@ public sealed class ReplayBufferService
 
         var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
         var sessionLoopback = _loopback;
-        process.Exited += (_, _) => OnBufferExited(process, sessionLoopback, bufferDir, profile, bufferSeconds, useDda);
+        process.Exited += (_, _) => OnBufferExited(process, sessionLoopback, bufferDir);
 
         // Publish under the lock before Start() so an instant exit's handler sees this session.
         lock (_gate)
@@ -139,7 +135,6 @@ public sealed class ReplayBufferService
             _process = process;
             _bufferDir = bufferDir;
             _profile = profile;
-            _bufferSeconds = bufferSeconds;
         }
 
         try
@@ -173,8 +168,7 @@ public sealed class ReplayBufferService
     public event EventHandler? Stopped;
 
     // Bound to a specific session; disposes only that session's own resources.
-    private void OnBufferExited(Process process, LoopbackCapturePipe? loopback, string? dir,
-                               RecordingProfile profile, int bufferSeconds, bool sessionUsedDda)
+    private void OnBufferExited(Process process, LoopbackCapturePipe? loopback, string? dir)
     {
         bool wasCurrent;
         lock (_gate)
@@ -191,30 +185,15 @@ public sealed class ReplayBufferService
         try { process.Dispose(); } catch { }
         loopback?.Dispose();
 
-        if (!wasCurrent)
+        if (wasCurrent)
         {
-            // A superseded session; Stop() owns its dir deletion.
-            return;
+            // Self-exit (not a user Stop): clean up this session's temp dir and notify. The view
+            // model decides whether to auto-restart on gdigrab (it does so on the UI thread, where
+            // start/stop are serialized, so there's no race with a concurrent user Stop()).
+            TryDeleteDirectory(dir);
+            Stopped?.Invoke(this, EventArgs.Empty);
         }
-
-        // Self-exit (not a user Stop): clean up this session's temp dir.
-        TryDeleteDirectory(dir);
-
-        // If a GPU Desktop Duplication session died on its own (e.g. a game grabbed the display in
-        // exclusive fullscreen), transparently restart the buffer on gdigrab so instant replay keeps
-        // working instead of silently stopping. One-shot, to avoid restart loops.
-        if (sessionUsedDda && !_ddaFallbackDone)
-        {
-            _ddaFallbackDone = true;
-            Task.Run(() =>
-            {
-                try { StartInternal(profile, bufferSeconds, preferDda: false); }
-                catch { Stopped?.Invoke(this, EventArgs.Empty); }
-            });
-            return;
-        }
-
-        Stopped?.Invoke(this, EventArgs.Empty);
+        // If not current, Stop() owns this session's dir deletion.
     }
 
     /// <summary>Stops the buffering process and deletes its rolling-segment temp directory.</summary>
@@ -564,7 +543,10 @@ public sealed class ReplayBufferService
 
         // Keyframe every segment so each .ts starts cleanly and concat works. Software encoders
         // also get an explicit forced-keyframe expression; hardware encoders rely on -g.
-        sb.Append(" -g ").Append((fps * SegmentSeconds).ToString(CultureInfo.InvariantCulture));
+        // Keyframe every segment so each .ts starts clean and concatenates. gdigrab tops out ~60fps,
+        // so base the GOP on the achievable rate there to keep keyframes aligned to the segment length.
+        var gopFps = usesDda ? fps : Math.Min(fps, 60);
+        sb.Append(" -g ").Append((gopFps * SegmentSeconds).ToString(CultureInfo.InvariantCulture));
         if (software)
         {
             sb.Append(" -force_key_frames ").Append(Quote($"expr:gte(t,n_forced*{SegmentSeconds})"));

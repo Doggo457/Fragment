@@ -60,7 +60,7 @@ public sealed class ScreenRecorder
     /// <summary>
     /// Builds the output path, constructs the ffmpeg command line and launches the capture process.
     /// </summary>
-    public async Task StartAsync(RecordingProfile profile)
+    public Task StartAsync(RecordingProfile profile)
     {
         if (profile is null)
         {
@@ -77,9 +77,11 @@ public sealed class ScreenRecorder
 
         // Pick the capture backend: GPU Desktop Duplication when it can actually capture right now,
         // otherwise the gdigrab compatibility path (so an exclusive-fullscreen game records normally
-        // instead of producing a black screen). The probe is ~0.2s, so run it off the UI thread.
+        // instead of producing a black screen). Done synchronously (the probe is ~0.2s) so the
+        // "already recording" check and the _process assignment below stay atomic on the caller's
+        // thread and a second start can't slip in.
         bool useDda = CanUseDesktopDuplication(profile)
-                      && await Task.Run(() => CaptureProbe.IsDesktopDuplicationWorking(_ffmpegPath));
+                      && CaptureProbe.IsDesktopDuplicationWorking(_ffmpegPath);
         LastCaptureUsedDesktopDuplication = useDda;
 
         string outputPath;
@@ -116,7 +118,7 @@ public sealed class ScreenRecorder
             _loopback?.Dispose();
             _loopback = null;
             Error?.Invoke(this, $"Failed to prepare recording: {ex.Message}");
-            return;
+            return Task.CompletedTask;
         }
 
         var startInfo = new ProcessStartInfo
@@ -152,7 +154,7 @@ public sealed class ScreenRecorder
                 process.Dispose();
                 sessionLoopback?.Dispose();
                 Error?.Invoke(this, "ffmpeg process failed to start.");
-                return;
+                return Task.CompletedTask;
             }
 
             ChildProcessTracker.Track(process); // dies with Fragment no matter how it exits
@@ -165,11 +167,11 @@ public sealed class ScreenRecorder
             try { process.Dispose(); } catch { }
             sessionLoopback?.Dispose();
             Error?.Invoke(this, $"Unable to launch ffmpeg: {ex.Message}");
-            return;
+            return Task.CompletedTask;
         }
 
         Started?.Invoke(this, EventArgs.Empty);
-        return;
+        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -572,9 +574,12 @@ public sealed class ScreenRecorder
             }
         }
 
-        // Keyframe roughly every 2 seconds for seekability.
+        // Keyframe roughly every 2 seconds of wall-clock time. gdigrab delivers at most ~60fps
+        // regardless of the requested rate, so base the GOP on the achievable rate on the fallback
+        // path (otherwise a 240 profile would space keyframes ~8s apart).
         var fps = profile.Fps > 0 ? profile.Fps : 60;
-        sb.Append(" -g ").Append((fps * 2).ToString(CultureInfo.InvariantCulture));
+        var gopFps = usesDda ? fps : Math.Min(fps, 60);
+        sb.Append(" -g ").Append((gopFps * 2).ToString(CultureInfo.InvariantCulture));
 
         // ----- Video filter + stream mapping -----
         if (usesDda)

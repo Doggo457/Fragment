@@ -24,6 +24,14 @@ internal static class CaptureProbe
             return false;
         }
 
+        // Retry once: a real exclusive-fullscreen block fails every time, but a momentary
+        // access-lost (mode switch, UAC secure desktop, a brief flip) can fail one instant and
+        // succeed the next — we don't want a transient blip to drop the whole session to 60fps.
+        return ProbeOnce(ffmpegPath) || ProbeOnce(ffmpegPath);
+    }
+
+    private static bool ProbeOnce(string ffmpegPath)
+    {
         try
         {
             var psi = new ProcessStartInfo
@@ -46,7 +54,7 @@ internal static class CaptureProbe
             p.BeginErrorReadLine();        // drain pipes so the child can't block
             p.BeginOutputReadLine();
 
-            if (!p.WaitForExit(4000))
+            if (!p.WaitForExit(2500))
             {
                 try { p.Kill(entireProcessTree: true); } catch { }
                 return false;

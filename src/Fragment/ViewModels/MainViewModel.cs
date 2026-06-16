@@ -36,6 +36,8 @@ namespace Fragment.ViewModels
 
         private bool _isInitializing = true;
         private bool _disposed;
+        private bool _replayDdaFallbackDone; // one-shot guard for the GPU->gdigrab replay auto-restart
+        private bool _replayDesired;         // true while the user wants the buffer on (gates auto-restart)
         private DateTime _recordStartedUtc;
 
         private string _statusText = "Idle";
@@ -401,6 +403,7 @@ namespace Fragment.ViewModels
             {
                 if (_replayBuffer.IsRunning)
                 {
+                    _replayDesired = false; // user turned it off: don't let a late stop event auto-restart it
                     _replayBuffer.Stop();
                     IsReplayRunning = false;
                     StatusText = "Replay buffer stopped";
@@ -424,6 +427,10 @@ namespace Fragment.ViewModels
             {
                 return;
             }
+
+            // A fresh user-initiated start re-arms the one-shot GPU->gdigrab auto-fallback.
+            _replayDdaFallbackDone = false;
+            _replayDesired = true;
 
             try
             {
@@ -565,6 +572,31 @@ namespace Fragment.ViewModels
             {
                 if (_disposed) return;
                 IsReplayRunning = false;
+
+                // If a GPU Desktop Duplication session died on its own (most likely a game grabbed the
+                // display in exclusive fullscreen), restart once on the gdigrab compatibility path so
+                // instant replay keeps working. Running here on the UI thread means this is serialized
+                // with the user's start/stop, so it can't race into an orphaned recording.
+                if (_replayDesired
+                    && _replayBuffer is { LastSessionUsedDesktopDuplication: true }
+                    && !_replayDdaFallbackDone)
+                {
+                    _replayDdaFallbackDone = true;
+                    try
+                    {
+                        _replayBuffer.Start(ActiveProfile(), _settings.ReplayBufferSeconds, allowDesktopDuplication: false);
+                        IsReplayRunning = _replayBuffer.IsRunning;
+                        StatusText = "Replay buffer running (compatibility mode)";
+                    }
+                    catch (Exception ex)
+                    {
+                        StatusText = $"Replay buffer stopped: {ex.Message}";
+                    }
+
+                    RefreshCanExecute();
+                    return;
+                }
+
                 if (!IsRecording)
                 {
                     StatusText = "Replay buffer stopped unexpectedly";
