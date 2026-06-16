@@ -45,9 +45,6 @@ public sealed class ScreenRecorder
     /// <summary>The absolute path of the file currently being written, or null when idle.</summary>
     public string? CurrentOutputPath { get; private set; }
 
-    /// <summary>True if the most recent start used GPU Desktop Duplication (vs the gdigrab fallback).</summary>
-    public bool LastCaptureUsedDesktopDuplication { get; private set; }
-
     /// <summary>Raised once the ffmpeg process has been launched.</summary>
     public event EventHandler? Started;
 
@@ -74,15 +71,6 @@ public sealed class ScreenRecorder
                 throw new InvalidOperationException("A recording is already in progress.");
             }
         }
-
-        // Pick the capture backend: GPU Desktop Duplication when it can actually capture right now,
-        // otherwise the gdigrab compatibility path (so an exclusive-fullscreen game records normally
-        // instead of producing a black screen). Done synchronously (the probe is ~0.2s typically,
-        // ~2.4s worst case) so the "already recording" check and the _process assignment below stay
-        // atomic on the caller's thread and a second start can't slip in.
-        bool useDda = CanUseDesktopDuplication(profile)
-                      && CaptureProbe.IsDesktopDuplicationWorking(_ffmpegPath);
-        LastCaptureUsedDesktopDuplication = useDda;
 
         string outputPath;
         string arguments;
@@ -111,7 +99,7 @@ public sealed class ScreenRecorder
                 }
             }
 
-            arguments = BuildArgumentsCore(profile, outputPath, loopbackInfo, useDda);
+            arguments = BuildArgumentsCore(profile, outputPath, loopbackInfo);
         }
         catch (Exception ex)
         {
@@ -304,18 +292,9 @@ public sealed class ScreenRecorder
     /// Exposed for unit testing.
     /// </summary>
     public static string BuildArguments(RecordingProfile profile, string outputPath)
-        => BuildArgumentsCore(profile, outputPath, null, CanUseDesktopDuplication(profile));
+        => BuildArgumentsCore(profile, outputPath, null);
 
-    /// <summary>
-    /// Whether this profile is a candidate for GPU Desktop Duplication capture. Window-by-title and
-    /// the GIF pipeline have no ddagrab path; everything else (full-screen / region) can use it if a
-    /// runtime probe says it's available.
-    /// </summary>
-    internal static bool CanUseDesktopDuplication(RecordingProfile profile)
-        => profile.Container != OutputContainer.Gif
-           && profile.Source is CaptureSource.FullScreen or CaptureSource.Region;
-
-    internal static string BuildArgumentsCore(RecordingProfile profile, string outputPath, LoopbackInfo? loopback, bool useDda)
+    internal static string BuildArgumentsCore(RecordingProfile profile, string outputPath, LoopbackInfo? loopback)
     {
         if (profile is null)
         {
@@ -332,15 +311,15 @@ public sealed class ScreenRecorder
         // Global flags. -y overwrites, banner hidden, errors-only logging to keep stderr clean.
         sb.Append("-hide_banner -loglevel error -y");
 
-        // ---- Video input (ddagrab GPU capture for full-screen/region, gdigrab otherwise) ----
-        AppendVideoInput(sb, profile, useDda);
+        // ---- Video input (gdigrab) ----
+        AppendVideoInput(sb, profile);
 
         // ---- Audio inputs (WASAPI loopback pipe and/or dshow), if any ----
         // GIF output carries no audio, so don't declare audio inputs that would go unmapped.
         var audioInputs = profile.Container == OutputContainer.Gif ? 0 : AppendAudioInputs(sb, profile, loopback);
 
         // ---- Encoding / mapping ----
-        AppendEncoding(sb, profile, audioInputs, useDda);
+        AppendEncoding(sb, profile, audioInputs);
 
         // ---- Output ----
         sb.Append(' ').Append(Quote(outputPath));
@@ -351,23 +330,9 @@ public sealed class ScreenRecorder
     /// <summary>
     /// Appends the gdigrab video input. Handles full-screen, monitor offset, region and window-title capture.
     /// </summary>
-    /// <summary>
-    /// Appends the video input. When <paramref name="useDda"/> is true, GPU Desktop Duplication
-    /// (ddagrab) is used (smooth, high-refresh, full-screen/region only); otherwise the gdigrab GDI
-    /// path is used, which also serves as the compatibility fallback for any source.
-    /// </summary>
-    private static void AppendVideoInput(StringBuilder sb, RecordingProfile profile, bool useDda)
+    private static void AppendVideoInput(StringBuilder sb, RecordingProfile profile)
     {
         var fps = profile.Fps > 0 ? profile.Fps : 60;
-
-        // ddagrab is GPU-based and can capture at the monitor's true refresh rate; gdigrab is a CPU
-        // GDI BitBlt poll that caps near 60fps. The caller decides which (gdigrab when a probe shows
-        // Desktop Duplication is blocked, e.g. an exclusive-fullscreen game).
-        if (useDda)
-        {
-            AppendDdaInput(sb, profile, fps);
-            return;
-        }
 
         sb.Append(" -f gdigrab");
         sb.Append(" -framerate ").Append(fps.ToString(CultureInfo.InvariantCulture));
@@ -405,32 +370,6 @@ public sealed class ScreenRecorder
                 AppendPrimaryFullScreen(sb);
                 break;
         }
-    }
-
-    /// <summary>
-    /// Appends a Desktop Duplication (ddagrab) GPU capture source for full-screen (primary output)
-    /// or a sub-region of it. ddagrab is a libavfilter source yielding D3D11/BGRA frames on the GPU;
-    /// <see cref="AppendEncoding"/> adds the hwdownload + pixel-format conversion and forces CFR.
-    /// </summary>
-    private static void AppendDdaInput(StringBuilder sb, RecordingProfile profile, int fps)
-    {
-        var dda = new StringBuilder("ddagrab=output_idx=0");
-        dda.Append(":framerate=").Append(fps.ToString(CultureInfo.InvariantCulture));
-        dda.Append(":draw_mouse=").Append(profile.CaptureCursor ? '1' : '0');
-
-        if (profile.Source == CaptureSource.Region)
-        {
-            var w = NormalizeEven(profile.RegionWidth > 0 ? profile.RegionWidth : 1920);
-            var h = NormalizeEven(profile.RegionHeight > 0 ? profile.RegionHeight : 1080);
-            dda.Append(":offset_x=").Append(profile.RegionX.ToString(CultureInfo.InvariantCulture));
-            dda.Append(":offset_y=").Append(profile.RegionY.ToString(CultureInfo.InvariantCulture));
-            dda.Append(":video_size=")
-               .Append(w.ToString(CultureInfo.InvariantCulture))
-               .Append('x')
-               .Append(h.ToString(CultureInfo.InvariantCulture));
-        }
-
-        sb.Append(" -f lavfi -i ").Append(Quote(dda.ToString()));
     }
 
     /// <summary>
@@ -535,7 +474,7 @@ public sealed class ScreenRecorder
     /// <summary>
     /// Appends codec selection, bitrate, container-specific flags and stream mapping.
     /// </summary>
-    private static void AppendEncoding(StringBuilder sb, RecordingProfile profile, int audioInputs, bool usesDda)
+    private static void AppendEncoding(StringBuilder sb, RecordingProfile profile, int audioInputs)
     {
         // GIF is a special-case pipeline: no audio, palette-friendly output.
         if (profile.Container == OutputContainer.Gif)
@@ -574,40 +513,14 @@ public sealed class ScreenRecorder
             }
         }
 
-        // Keyframe roughly every 2 seconds of wall-clock time. gdigrab delivers at most ~60fps
-        // regardless of the requested rate, so base the GOP on the achievable rate on the fallback
-        // path (otherwise a 240 profile would space keyframes ~8s apart).
+        // Keyframe roughly every 2 seconds for seekability.
         var fps = profile.Fps > 0 ? profile.Fps : 60;
-        var gopFps = usesDda ? fps : Math.Min(fps, 60);
-        sb.Append(" -g ").Append((gopFps * 2).ToString(CultureInfo.InvariantCulture));
+        sb.Append(" -g ").Append((fps * 2).ToString(CultureInfo.InvariantCulture));
 
-        // ----- Video filter + stream mapping -----
-        if (usesDda)
+        // ----- Audio handling / mapping -----
+        if (audioInputs == 0)
         {
-            // ddagrab delivers GPU (D3D11/BGRA) frames: pull them to system memory and convert to the
-            // encoder's pixel format in a filtergraph (which must also carry any audio mix, since
-            // -filter_complex and -vf can't coexist).
-            var fc = new StringBuilder();
-            fc.Append("[0:v]hwdownload,format=bgra,format=").Append(software ? "yuv420p" : "nv12").Append("[v]");
-            if (audioInputs == 2)
-            {
-                fc.Append(";[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=2[aout]");
-            }
-            sb.Append(" -filter_complex ").Append(Quote(fc.ToString()));
-            sb.Append(" -map ").Append(Quote("[v]"));
-
-            if (audioInputs == 2) sb.Append(" -map ").Append(Quote("[aout]"));
-            else if (audioInputs == 1) sb.Append(" -map 1:a");
-            else sb.Append(" -an");
-
-            // Force constant frame rate at the capture rate. ddagrab's timestamps are vsync-accurate,
-            // so CFR locks a clean cadence (padding genuinely static content with duplicate frames)
-            // WITHOUT the dup/drop judder that CFR causes on gdigrab's jittery wall-clock timing.
-            sb.Append(" -fps_mode cfr -r ").Append(fps.ToString(CultureInfo.InvariantCulture));
-        }
-        else if (audioInputs == 0)
-        {
-            // No audio captured (gdigrab path).
+            // No audio captured.
             sb.Append(" -an");
         }
         else
@@ -625,11 +538,7 @@ public sealed class ScreenRecorder
                 // Single audio input at index 1.
                 sb.Append(" -map 0:v -map 1:a");
             }
-        }
 
-        // Audio codec / bitrate (shared by both video paths when audio is present).
-        if (audioInputs > 0)
-        {
             sb.Append(" -c:a ").Append(MapAudioCodec(profile.Container));
             if (profile.AudioBitrateKbps > 0)
             {

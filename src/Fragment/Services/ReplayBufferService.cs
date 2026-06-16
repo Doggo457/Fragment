@@ -33,9 +33,6 @@ public sealed class ReplayBufferService
     private RecordingProfile? _profile;
     private LoopbackCapturePipe? _loopback;
 
-    /// <summary>True if the current/last buffer session captured via GPU Desktop Duplication.</summary>
-    public bool LastSessionUsedDesktopDuplication { get; private set; }
-
     public ReplayBufferService(string ffmpegPath)
     {
         if (string.IsNullOrWhiteSpace(ffmpegPath))
@@ -62,7 +59,7 @@ public sealed class ReplayBufferService
     /// Starts continuous segmented recording into a fresh temp directory. The number of retained
     /// segments is sized to cover at least <paramref name="bufferSeconds"/> seconds.
     /// </summary>
-    public void Start(RecordingProfile profile, int bufferSeconds, bool allowDesktopDuplication = true)
+    public void Start(RecordingProfile profile, int bufferSeconds)
     {
         if (profile is null)
         {
@@ -81,14 +78,6 @@ public sealed class ReplayBufferService
                 throw new InvalidOperationException("Replay buffer is already running.");
             }
         }
-
-        // GPU Desktop Duplication when it can capture right now; otherwise gdigrab (so the buffer
-        // keeps recording an exclusive-fullscreen game instead of going black). The caller can force
-        // gdigrab (allowDesktopDuplication=false) when restarting after a GPU session was blocked.
-        bool useDda = allowDesktopDuplication
-                      && ScreenRecorder.CanUseDesktopDuplication(profile)
-                      && CaptureProbe.IsDesktopDuplicationWorking(_ffmpegPath);
-        LastSessionUsedDesktopDuplication = useDda;
 
         var bufferDir = CreateBufferDirectory();
         var wrap = ComputeSegmentWrap(bufferSeconds);
@@ -112,7 +101,7 @@ public sealed class ReplayBufferService
             }
         }
 
-        var arguments = BuildBufferArguments(profile, bufferDir, wrap, loopbackInfo, useDda);
+        var arguments = BuildBufferArguments(profile, bufferDir, wrap, loopbackInfo);
 
         var startInfo = new ProcessStartInfo
         {
@@ -187,9 +176,7 @@ public sealed class ReplayBufferService
 
         if (wasCurrent)
         {
-            // Self-exit (not a user Stop): clean up this session's temp dir and notify. The view
-            // model decides whether to auto-restart on gdigrab (it does so on the UI thread, where
-            // start/stop are serialized, so there's no race with a concurrent user Stop()).
+            // Self-exit (not a user Stop): clean up this session's temp dir and notify.
             TryDeleteDirectory(dir);
             Stopped?.Invoke(this, EventArgs.Empty);
         }
@@ -385,13 +372,13 @@ public sealed class ReplayBufferService
     /// Builds the segment-muxer command: capture the screen (and audio) and write a rolling ring of
     /// fixed-length .ts segments. <c>-segment_wrap</c> caps the number of files on disk.
     /// </summary>
-    private static string BuildBufferArguments(RecordingProfile profile, string bufferDir, int wrap, LoopbackInfo? loopback, bool useDda)
+    private static string BuildBufferArguments(RecordingProfile profile, string bufferDir, int wrap, LoopbackInfo? loopback)
     {
         var sb = new StringBuilder();
         sb.Append("-hide_banner -loglevel error -y");
 
         // Reuse the recorder's input + encoding logic by building the capture portion here.
-        AppendCapture(sb, profile, loopback, useDda);
+        AppendCapture(sb, profile, loopback);
 
         // Segment muxer: rolling, wrapping, fixed-duration TS files. reset_timestamps keeps each
         // segment independently playable / concatenatable.
@@ -435,17 +422,11 @@ public sealed class ReplayBufferService
     /// Audio (when present) is mixed/mapped; output is forced to a TS-friendly codec set
     /// (H.264 + AAC) so segments concatenate cleanly regardless of profile container.
     /// </summary>
-    private static void AppendCapture(StringBuilder sb, RecordingProfile profile, LoopbackInfo? loopback, bool usesDda)
+    private static void AppendCapture(StringBuilder sb, RecordingProfile profile, LoopbackInfo? loopback)
     {
         var fps = profile.Fps > 0 ? profile.Fps : 60;
 
         // ---- Video input ----
-        if (usesDda)
-        {
-            AppendDdaInput(sb, profile, fps);
-        }
-        else
-        {
         sb.Append(" -f gdigrab");
         sb.Append(" -framerate ").Append(fps.ToString(CultureInfo.InvariantCulture));
         sb.Append(" -draw_mouse ").Append(profile.CaptureCursor ? '1' : '0');
@@ -514,7 +495,6 @@ public sealed class ReplayBufferService
                 sb.Append(" -i ").Append(Quote("desktop"));
                 break;
         }
-        }
 
         // ---- Audio inputs ----
         var audioInputs = AppendAudioInputs(sb, profile, loopback);
@@ -543,34 +523,13 @@ public sealed class ReplayBufferService
 
         // Keyframe every segment so each .ts starts cleanly and concat works. Software encoders
         // also get an explicit forced-keyframe expression; hardware encoders rely on -g.
-        // Keyframe every segment so each .ts starts clean and concatenates. gdigrab tops out ~60fps,
-        // so base the GOP on the achievable rate there to keep keyframes aligned to the segment length.
-        var gopFps = usesDda ? fps : Math.Min(fps, 60);
-        sb.Append(" -g ").Append((gopFps * SegmentSeconds).ToString(CultureInfo.InvariantCulture));
+        sb.Append(" -g ").Append((fps * SegmentSeconds).ToString(CultureInfo.InvariantCulture));
         if (software)
         {
             sb.Append(" -force_key_frames ").Append(Quote($"expr:gte(t,n_forced*{SegmentSeconds})"));
         }
 
-        if (usesDda)
-        {
-            // ddagrab gives GPU (D3D11/BGRA) frames: download + convert in a filtergraph that also
-            // carries any audio mix. CFR at the capture rate keeps the rolling segments evenly paced.
-            var fc = new StringBuilder();
-            fc.Append("[0:v]hwdownload,format=bgra,format=").Append(software ? "yuv420p" : "nv12").Append("[v]");
-            if (audioInputs == 2)
-            {
-                fc.Append(";[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=2[aout]");
-            }
-            sb.Append(" -filter_complex ").Append(Quote(fc.ToString()));
-            sb.Append(" -map ").Append(Quote("[v]"));
-            if (audioInputs == 2) sb.Append(" -map ").Append(Quote("[aout]"));
-            else if (audioInputs == 1) sb.Append(" -map 1:a");
-            else sb.Append(" -an");
-
-            sb.Append(" -fps_mode cfr -r ").Append(fps.ToString(CultureInfo.InvariantCulture));
-        }
-        else if (audioInputs == 0)
+        if (audioInputs == 0)
         {
             sb.Append(" -an");
         }
@@ -586,10 +545,7 @@ public sealed class ReplayBufferService
             {
                 sb.Append(" -map 0:v -map 1:a");
             }
-        }
 
-        if (audioInputs > 0)
-        {
             sb.Append(" -c:a aac");
             if (profile.AudioBitrateKbps > 0)
             {
@@ -739,31 +695,6 @@ public sealed class ReplayBufferService
         {
             // Ignore cleanup failures.
         }
-    }
-
-    /// <summary>
-    /// Appends a Desktop Duplication (ddagrab) GPU capture source for full-screen (primary output)
-    /// or a sub-region of it. The encoder side adds the hwdownload + pixel-format conversion + CFR.
-    /// </summary>
-    private static void AppendDdaInput(StringBuilder sb, RecordingProfile profile, int fps)
-    {
-        var dda = new StringBuilder("ddagrab=output_idx=0");
-        dda.Append(":framerate=").Append(fps.ToString(CultureInfo.InvariantCulture));
-        dda.Append(":draw_mouse=").Append(profile.CaptureCursor ? '1' : '0');
-
-        if (profile.Source == CaptureSource.Region)
-        {
-            var w = NormalizeEven(profile.RegionWidth > 0 ? profile.RegionWidth : 1920);
-            var h = NormalizeEven(profile.RegionHeight > 0 ? profile.RegionHeight : 1080);
-            dda.Append(":offset_x=").Append(profile.RegionX.ToString(CultureInfo.InvariantCulture));
-            dda.Append(":offset_y=").Append(profile.RegionY.ToString(CultureInfo.InvariantCulture));
-            dda.Append(":video_size=")
-               .Append(w.ToString(CultureInfo.InvariantCulture))
-               .Append('x')
-               .Append(h.ToString(CultureInfo.InvariantCulture));
-        }
-
-        sb.Append(" -f lavfi -i ").Append(Quote(dda.ToString()));
     }
 
     private static string Quote(string value)
