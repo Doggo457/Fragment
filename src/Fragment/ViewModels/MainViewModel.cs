@@ -76,7 +76,7 @@ namespace Fragment.ViewModels
                 _ => _replayBuffer is { IsRunning: true });
             ToggleReplayCommand = new RelayCommand(_ => ToggleReplay(), _ => _replayBuffer != null);
             OpenSettingsCommand = new RelayCommand(_ => OpenSettings());
-            OpenTrimmerCommand = new RelayCommand(_ => OpenTrimmer());
+            OpenEditorCommand = new RelayCommand(_ => OpenEditor());
             OpenOutputFolderCommand = new RelayCommand(_ => OpenOutputFolder());
         }
 
@@ -328,7 +328,7 @@ namespace Fragment.ViewModels
         public ICommand SaveClipCommand { get; }
         public ICommand ToggleReplayCommand { get; }
         public ICommand OpenSettingsCommand { get; }
-        public ICommand OpenTrimmerCommand { get; }
+        public ICommand OpenEditorCommand { get; }
         public ICommand OpenOutputFolderCommand { get; }
 
         // ---------------------------------------------------------------------
@@ -507,7 +507,7 @@ namespace Fragment.ViewModels
             }
         }
 
-        private void OpenTrimmer()
+        private void OpenEditor()
         {
             try
             {
@@ -517,7 +517,7 @@ namespace Fragment.ViewModels
                     return;
                 }
 
-                var window = new Views.TrimmerWindow(new ClipTrimmer(_ffmpegPath!));
+                var window = new Views.EditorWindow(new VideoEditorService(_ffmpegPath!));
 
                 if (Application.Current?.MainWindow is { } owner && !ReferenceEquals(owner, window))
                 {
@@ -528,7 +528,7 @@ namespace Fragment.ViewModels
             }
             catch (Exception ex)
             {
-                StatusText = $"Trimmer error: {ex.Message}";
+                StatusText = $"Editor error: {ex.Message}";
             }
         }
 

@@ -238,8 +238,8 @@
                     Content="Settings" />
             <Button Grid.Column="2"
                     Style="{StaticResource FlatButton}"
-                    Command="{Binding OpenTrimmerCommand}"
-                    Content="Trim" />
+                    Command="{Binding OpenEditorCommand}"
+                    Content="Editor" />
             <Button Grid.Column="4"
                     Style="{StaticResource FlatButton}"
                     Command="{Binding OpenOutputFolderCommand}"

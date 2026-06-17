@@ -1,0 +1,165 @@
+<Window x:Class="Fragment.Views.EditorWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Fragment — Editor"
+        Icon="/app.ico"
+        Width="960" Height="760"
+        MinWidth="820" MinHeight="660"
+        WindowStartupLocation="CenterOwner"
+        Background="{StaticResource WindowBackgroundBrush}"
+        Foreground="{StaticResource ForegroundBrush}"
+        FontFamily="Segoe UI" FontSize="13"
+        AllowDrop="True" PreviewDragOver="OnDragOver" PreviewDrop="OnDrop">
+
+    <Window.Resources>
+        <Style x:Key="LabelText" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource SubtleForegroundBrush}"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="Margin" Value="0,0,8,0"/>
+        </Style>
+        <Style x:Key="MonoTime" TargetType="TextBlock">
+            <Setter Property="FontFamily" Value="Consolas"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}"/>
+        </Style>
+    </Window.Resources>
+
+    <DockPanel LastChildFill="True">
+
+        <!-- ===== Input ===== -->
+        <Grid DockPanel.Dock="Top" Margin="16,14,16,8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Style="{StaticResource LabelText}" Text="Video"/>
+            <TextBox Grid.Column="1" x:Name="InputBox" IsReadOnly="True" VerticalContentAlignment="Center"/>
+            <Button Grid.Column="2" Content="Open…" Margin="8,0,0,0" Click="OnBrowseClick"/>
+            <Button Grid.Column="3" Content="Add clip…" Margin="8,0,0,0" Click="OnAddClipClick"
+                    ToolTip="Append another video to the end of the sequence"/>
+        </Grid>
+
+        <!-- ===== Bottom action bar ===== -->
+        <Border DockPanel.Dock="Bottom"
+                Background="{StaticResource PanelBackgroundBrush}"
+                BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0"
+                Padding="16,10">
+            <Grid>
+                <TextBlock x:Name="StatusText" VerticalAlignment="Center"
+                           Foreground="{StaticResource SubtleForegroundBrush}" TextTrimming="CharacterEllipsis"
+                           Text="Open a video to start. Cut with Split / Delete, add clips to merge, then Export."/>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button x:Name="ExportButton" Content="Export" Style="{StaticResource AccentButton}" Click="OnExportClick"/>
+                    <Button Content="Close" Margin="8,0,0,0" Click="OnCloseClick"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Grid Margin="16,8,16,12">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*"/>      <!-- preview -->
+                <RowDefinition Height="Auto"/>   <!-- transport -->
+                <RowDefinition Height="Auto"/>   <!-- timeline -->
+                <RowDefinition Height="Auto"/>   <!-- segment ops -->
+                <RowDefinition Height="Auto"/>   <!-- export options -->
+            </Grid.RowDefinitions>
+
+            <!-- Preview -->
+            <Border Grid.Row="0" Background="#FF000000" CornerRadius="8" ClipToBounds="True">
+                <Grid>
+                    <MediaElement x:Name="Media"
+                                  LoadedBehavior="Manual" UnloadedBehavior="Manual"
+                                  ScrubbingEnabled="True" Stretch="Uniform"
+                                  MediaOpened="OnMediaOpened" MediaFailed="OnMediaFailed" MediaEnded="OnMediaEnded"/>
+                    <TextBlock x:Name="PreviewHint"
+                               Text="Open a video to preview and edit — or drag &amp; drop a file here"
+                               Foreground="{StaticResource SubtleForegroundBrush}"
+                               HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                </Grid>
+            </Border>
+
+            <!-- Transport -->
+            <Grid Grid.Row="1" Margin="0,10,0,6">
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button x:Name="PlayButton" Content="▶ Play" Width="92" Click="OnPlayPauseClick" IsEnabled="False"/>
+                    <TextBlock Margin="14,0,0,0" Style="{StaticResource LabelText}" Text="Total"/>
+                    <TextBlock x:Name="TotalRun" Style="{StaticResource MonoTime}" Text="00:00:00.0"/>
+                </StackPanel>
+                <TextBlock HorizontalAlignment="Right" Style="{StaticResource MonoTime}">
+                    <Run x:Name="PositionRun" Text="00:00:00.0"/>
+                </TextBlock>
+            </Grid>
+
+            <!-- Sequence timeline (filmstrip; populated in code-behind) -->
+            <Border Grid.Row="2" Background="{StaticResource PanelBackgroundBrush}"
+                    BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="8" Padding="6">
+                <Canvas x:Name="SequenceCanvas" Height="72" Background="Transparent"
+                        ClipToBounds="True"
+                        SizeChanged="OnTimelineSizeChanged"
+                        MouseLeftButtonDown="OnTimelineMouseDown"/>
+            </Border>
+
+            <!-- Segment ops -->
+            <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,10,0,0">
+                <Button Content="✂ Split at playhead" Click="OnSplitClick" ToolTip="Split the segment under the playhead in two"/>
+                <Button Content="🗑 Delete segment" Margin="8,0,0,0" Click="OnDeleteClick" ToolTip="Remove the selected segment"/>
+                <Button Content="◀ Move" Margin="8,0,0,0" Click="OnMoveLeftClick" ToolTip="Move the selected segment earlier"/>
+                <Button Content="Move ▶" Margin="8,0,0,0" Click="OnMoveRightClick" ToolTip="Move the selected segment later"/>
+                <TextBlock x:Name="SegInfo" Margin="16,0,0,0" Style="{StaticResource LabelText}" Text=""/>
+            </StackPanel>
+
+            <!-- Export options -->
+            <Border Grid.Row="4" Margin="0,12,0,0" Padding="12,10"
+                    Background="{StaticResource PanelBackgroundBrush}"
+                    BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" CornerRadius="8">
+                <WrapPanel Orientation="Horizontal">
+                    <StackPanel Orientation="Horizontal" Margin="0,4,18,4">
+                        <TextBlock Style="{StaticResource LabelText}" Text="Format"/>
+                        <ComboBox x:Name="FormatBox" Width="90" SelectedIndex="0" SelectionChanged="OnFormatChanged">
+                            <ComboBoxItem Content="MP4"/>
+                            <ComboBoxItem Content="GIF"/>
+                        </ComboBox>
+                    </StackPanel>
+
+                    <StackPanel Orientation="Horizontal" Margin="0,4,18,4">
+                        <TextBlock Style="{StaticResource LabelText}" Text="Resolution"/>
+                        <ComboBox x:Name="ResolutionBox" Width="130" SelectedIndex="0">
+                            <ComboBoxItem Content="Keep original"/>
+                            <ComboBoxItem Content="1080p"/>
+                            <ComboBoxItem Content="720p"/>
+                            <ComboBoxItem Content="480p"/>
+                        </ComboBox>
+                    </StackPanel>
+
+                    <StackPanel x:Name="SizePanel" Orientation="Horizontal" Margin="0,4,18,4">
+                        <TextBlock Style="{StaticResource LabelText}" Text="Target size"/>
+                        <ComboBox x:Name="SizeBox" Width="150" SelectedIndex="0">
+                            <ComboBoxItem Content="Best quality"/>
+                            <ComboBoxItem Content="Discord (10 MB)"/>
+                            <ComboBoxItem Content="Discord Nitro (50 MB)"/>
+                            <ComboBoxItem Content="25 MB"/>
+                        </ComboBox>
+                    </StackPanel>
+
+                    <StackPanel x:Name="AudioPanel" Orientation="Horizontal" Margin="0,4,18,4">
+                        <TextBlock Style="{StaticResource LabelText}" Text="Audio"/>
+                        <ComboBox x:Name="AudioBox" Width="110" SelectedIndex="0" SelectionChanged="OnAudioChanged">
+                            <ComboBoxItem Content="Keep"/>
+                            <ComboBoxItem Content="Mute"/>
+                            <ComboBoxItem Content="Volume…"/>
+                        </ComboBox>
+                        <Slider x:Name="VolumeSlider" Width="90" Minimum="0" Maximum="2" Value="1"
+                                Margin="8,0,0,0" VerticalAlignment="Center" Visibility="Collapsed"
+                                TickFrequency="0.25" IsSnapToTickEnabled="True"
+                                ToolTip="Playback volume multiplier"/>
+                    </StackPanel>
+
+                    <CheckBox x:Name="FastCopyCheck" Content="Fast cut (no re-encode)" VerticalAlignment="Center"
+                              Margin="0,4,0,4" ToolTip="Lossless &amp; near-instant; MP4 only, ignores resize/size/audio options"/>
+                </WrapPanel>
+            </Border>
+        </Grid>
+    </DockPanel>
+</Window>
