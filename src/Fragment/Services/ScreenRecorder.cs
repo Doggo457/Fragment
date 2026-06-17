@@ -18,6 +18,8 @@ public sealed class ScreenRecorder
     private readonly string _ffmpegPath;
     private Process? _process;
     private LoopbackCapturePipe? _loopback;
+    private WgcCapture? _wgc;      // live WGC session; MUST be disposed to remove the yellow capture border
+    private WgcFramePump? _pump;   // feeds WGC frames into ffmpeg stdin (null on the gdigrab path)
     private readonly object _gate = new();
 
     public ScreenRecorder(string ffmpegPath)
@@ -75,6 +77,8 @@ public sealed class ScreenRecorder
         string outputPath;
         string arguments;
         LoopbackInfo? loopbackInfo = null;
+        WgcCapture? wgc = null;
+        WgcFramePump? pump = null;
         try
         {
             outputPath = ResolveOutputPath(profile);
@@ -99,12 +103,24 @@ public sealed class ScreenRecorder
                 }
             }
 
-            arguments = BuildArgumentsCore(profile, outputPath, loopbackInfo);
+            // GPU capture via Windows.Graphics.Capture (catches hardware-overlay/MPO content that
+            // gdigrab/ddagrab miss). Falls back to gdigrab if WGC isn't usable for this source.
+            var wgcDims = TryStartWgc(profile, out wgc);
+            (int Width, int Height, string Pipe)? wgcArg = null;
+            if (wgc != null && wgcDims is { } d)
+            {
+                pump = new WgcFramePump(wgc, profile.Fps > 0 ? profile.Fps : 60, d.Width, d.Height);
+                wgcArg = (d.Width, d.Height, pump.FfmpegInputPath);
+            }
+
+            arguments = BuildArgumentsCore(profile, outputPath, loopbackInfo, wgcArg);
         }
         catch (Exception ex)
         {
             _loopback?.Dispose();
             _loopback = null;
+            try { pump?.Stop(); } catch { }
+            try { wgc?.Dispose(); } catch { }
             Error?.Invoke(this, $"Failed to prepare recording: {ex.Message}");
             return Task.CompletedTask;
         }
@@ -124,7 +140,7 @@ public sealed class ScreenRecorder
         // from a previous session can never tear down a freshly-started one.
         var sessionLoopback = _loopback;
         var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-        process.Exited += (_, _) => OnProcessExited(process, sessionLoopback);
+        process.Exited += (_, _) => OnProcessExited(process, sessionLoopback, wgc, pump);
         process.ErrorDataReceived += OnErrorDataReceived;
 
         // Publish state under the lock BEFORE Start() so an instant exit's handler sees this process.
@@ -132,15 +148,19 @@ public sealed class ScreenRecorder
         {
             _process = process;
             CurrentOutputPath = outputPath;
+            _wgc = wgc;
+            _pump = pump;
         }
 
         try
         {
             if (!process.Start())
             {
-                lock (_gate) { if (ReferenceEquals(_process, process)) { _process = null; CurrentOutputPath = null; } _loopback = null; }
+                lock (_gate) { if (ReferenceEquals(_process, process)) { _process = null; CurrentOutputPath = null; } _loopback = null; _wgc = null; _pump = null; }
                 process.Dispose();
                 sessionLoopback?.Dispose();
+                try { pump?.Stop(); } catch { }
+                try { wgc?.Dispose(); } catch { }
                 Error?.Invoke(this, "ffmpeg process failed to start.");
                 return Task.CompletedTask;
             }
@@ -151,9 +171,11 @@ public sealed class ScreenRecorder
         }
         catch (Exception ex)
         {
-            lock (_gate) { if (ReferenceEquals(_process, process)) { _process = null; CurrentOutputPath = null; } _loopback = null; }
+            lock (_gate) { if (ReferenceEquals(_process, process)) { _process = null; CurrentOutputPath = null; } _loopback = null; _wgc = null; _pump = null; }
             try { process.Dispose(); } catch { }
             sessionLoopback?.Dispose();
+            try { pump?.Stop(); } catch { }
+            try { wgc?.Dispose(); } catch { }
             Error?.Invoke(this, $"Unable to launch ffmpeg: {ex.Message}");
             return Task.CompletedTask;
         }
@@ -163,24 +185,76 @@ public sealed class ScreenRecorder
     }
 
     /// <summary>
+    /// Decides whether to capture via WGC (GPU, catches overlay/MPO content) and, if so, starts the
+    /// capture and returns its frame size. Full-screen and monitor sources use WGC; window-by-title,
+    /// region and GIF stay on gdigrab. Returns null (and leaves <paramref name="wgc"/> null) to use gdigrab.
+    /// </summary>
+    internal static (int Width, int Height)? TryStartWgc(RecordingProfile profile, out WgcCapture? wgc)
+    {
+        wgc = null;
+        if (!WgcCapture.IsSupported ||
+            profile.Container == OutputContainer.Gif ||
+            profile.Source is not (CaptureSource.FullScreen or CaptureSource.Monitor))
+        {
+            return null;
+        }
+
+        try
+        {
+            IntPtr hmon;
+            if (profile.Source == CaptureSource.Monitor)
+            {
+                var mon = MonitorEnumerator.GetByIndex(profile.MonitorIndex);
+                hmon = mon is not null
+                    ? WgcCapture.MonitorFromPoint(mon.X + 1, mon.Y + 1)
+                    : WgcCapture.MonitorFromPoint(0, 0);
+            }
+            else
+            {
+                hmon = WgcCapture.MonitorFromPoint(0, 0); // primary
+            }
+
+            var cap = new WgcCapture(hmon, profile.CaptureCursor);
+            if (cap.WaitForFirstFrame(2500, out int w, out int h))
+            {
+                wgc = cap;
+                return (w, h);
+            }
+            cap.Dispose();
+        }
+        catch
+        {
+            // WGC unavailable for this surface — fall back to gdigrab.
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Requests a graceful stop by writing 'q' to ffmpeg's stdin and awaiting clean exit.
     /// </summary>
     public async Task StopAsync()
     {
         Process? process;
+        WgcCapture? wgc;
+        WgcFramePump? pump;
         lock (_gate)
         {
             process = _process;
+            wgc = _wgc;
+            pump = _pump;
         }
 
         if (process is null || process.HasExited)
         {
+            try { pump?.Stop(); } catch { }
+            try { wgc?.Dispose(); } catch { }
             return;
         }
 
         try
         {
-            // 'q' tells ffmpeg to finalize the output (flush muxer trailer) and exit.
+            // 'q' tells ffmpeg to finalize the output (flush muxer trailer) and exit. WGC video rides
+            // a named pipe (not stdin), so 'q' works on both paths and stops the live audio inputs too.
             await process.StandardInput.WriteLineAsync("q").ConfigureAwait(false);
             await process.StandardInput.FlushAsync().ConfigureAwait(false);
         }
@@ -204,6 +278,12 @@ public sealed class ScreenRecorder
         {
             // The Exited handler may have disposed the process concurrently; that's a clean stop.
         }
+
+        // Order matters: stop/join the pump (it reads from the capture) BEFORE disposing the WGC
+        // capture, and only after ffmpeg has finalized above so it kept its frame source. Disposing
+        // the capture disposes its GraphicsCaptureSession, which clears the yellow capture border.
+        try { pump?.Stop(); } catch { } // release the video pipe + pump thread
+        try { wgc?.Dispose(); } catch { } // dispose the WGC session -> removes the capture border
     }
 
     private void OnErrorDataReceived(object sender, DataReceivedEventArgs e)
@@ -214,7 +294,7 @@ public sealed class ScreenRecorder
 
     // Bound to a specific (process, loopback) session via the Exited lambda, so a late exit from an
     // old recording disposes only its own resources and never clobbers a newer session's state/UI.
-    private void OnProcessExited(Process process, LoopbackCapturePipe? loopback)
+    private void OnProcessExited(Process process, LoopbackCapturePipe? loopback, WgcCapture? wgc, WgcFramePump? pump)
     {
         bool wasCurrent = false;
         string? output = null;
@@ -226,6 +306,8 @@ public sealed class ScreenRecorder
                 output = CurrentOutputPath;
                 _process = null;
                 CurrentOutputPath = null;
+                _wgc = null;
+                _pump = null;
             }
             if (ReferenceEquals(_loopback, loopback))
             {
@@ -237,6 +319,8 @@ public sealed class ScreenRecorder
         try { exitCode = process.ExitCode; } catch (Exception) { }
         try { process.Dispose(); } catch (Exception) { }
         loopback?.Dispose();
+        try { pump?.Stop(); } catch { }
+        try { wgc?.Dispose(); } catch { } // bound to this session, so always release it
 
         if (!wasCurrent)
         {
@@ -292,9 +376,10 @@ public sealed class ScreenRecorder
     /// Exposed for unit testing.
     /// </summary>
     public static string BuildArguments(RecordingProfile profile, string outputPath)
-        => BuildArgumentsCore(profile, outputPath, null);
+        => BuildArgumentsCore(profile, outputPath, null, null);
 
-    internal static string BuildArgumentsCore(RecordingProfile profile, string outputPath, LoopbackInfo? loopback)
+    internal static string BuildArgumentsCore(RecordingProfile profile, string outputPath,
+                                              LoopbackInfo? loopback, (int Width, int Height, string Pipe)? wgc)
     {
         if (profile is null)
         {
@@ -311,8 +396,26 @@ public sealed class ScreenRecorder
         // Global flags. -y overwrites, banner hidden, errors-only logging to keep stderr clean.
         sb.Append("-hide_banner -loglevel error -y");
 
-        // ---- Video input (gdigrab) ----
-        AppendVideoInput(sb, profile);
+        // ---- Video input ----
+        if (wgc is { } dims)
+        {
+            // Frames come from in-app WGC capture, streamed in as raw BGRA over a named pipe
+            // (WgcFramePump). stdin stays free for the graceful 'q' stop.
+            var fps = profile.Fps > 0 ? profile.Fps : 60;
+            // -thread_queue_size on the VIDEO input (symmetric with the audio inputs): gives ffmpeg's
+            // video reader thread its own buffer so it keeps draining the pipe even when the audio
+            // filter/encoder is momentarily busy. Without it the video reader could block, back-pressure
+            // the pump, and produce clustered duplicate frames.
+            sb.Append(" -thread_queue_size 512 -f rawvideo -pixel_format bgra -video_size ")
+              .Append(dims.Width.ToString(CultureInfo.InvariantCulture)).Append('x')
+              .Append(dims.Height.ToString(CultureInfo.InvariantCulture))
+              .Append(" -framerate ").Append(fps.ToString(CultureInfo.InvariantCulture))
+              .Append(" -i ").Append(Quote(dims.Pipe));
+        }
+        else
+        {
+            AppendVideoInput(sb, profile);
+        }
 
         // ---- Audio inputs (WASAPI loopback pipe and/or dshow), if any ----
         // GIF output carries no audio, so don't declare audio inputs that would go unmapped.

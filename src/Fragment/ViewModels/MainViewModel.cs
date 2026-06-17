@@ -38,6 +38,13 @@ namespace Fragment.ViewModels
         private bool _disposed;
         private DateTime _recordStartedUtc;
 
+        // A direct recording and the always-on replay buffer both capture the whole screen.
+        // Running two WGC captures + two encoders at once halves the delivered frame rate
+        // (~54fps -> ~36fps) and causes the stutter. A direct recording already captures
+        // everything, so we pause the buffer for its duration and resume it afterward.
+        private bool _resumeBufferAfterRecording;
+        private bool _recordTransition; // true while a start/stop is in flight (UI-thread re-entry guard)
+
         private string _statusText = "Idle";
         private bool _isRecording;
         private bool _isReplayRunning;
@@ -336,6 +343,8 @@ namespace Fragment.ViewModels
                 return;
             }
 
+            if (_recordTransition) return; // ignore a rapid second trigger while a start/stop is in flight
+            _recordTransition = true;
             try
             {
                 if (_recorder.IsRecording)
@@ -346,12 +355,36 @@ namespace Fragment.ViewModels
                 else
                 {
                     StatusText = "Starting...";
+
+                    // Pause the buffer so only one capture runs during the recording
+                    // (two simultaneous captures starve each other -> stutter). We resume
+                    // it once the recording stops.
+                    if (_replayBuffer is { IsRunning: true })
+                    {
+                        _replayBuffer.Stop();
+                        IsReplayRunning = false;
+                        _resumeBufferAfterRecording = true;
+                    }
+
                     await _recorder.StartAsync(ActiveProfile());
+
+                    // StartAsync reports failure via the Error event, not an exception, so if the
+                    // process never came up, resume the buffer here rather than leaving it paused
+                    // while waiting on the async callback.
+                    if (!_recorder.IsRecording)
+                    {
+                        ResumeBufferIfPaused();
+                    }
                 }
             }
             catch (Exception ex)
             {
                 StatusText = $"Error: {ex.Message}";
+                ResumeBufferIfPaused(); // never strand the buffer if the start threw
+            }
+            finally
+            {
+                _recordTransition = false;
             }
 
             RefreshCanExecute();
@@ -359,6 +392,14 @@ namespace Fragment.ViewModels
 
         private async System.Threading.Tasks.Task SaveClipAsync()
         {
+            // The buffer is intentionally paused during a direct recording; tell the user that rather
+            // than the generic "not running" (which sounds like it was never started or crashed).
+            if (IsRecording)
+            {
+                StatusText = "Can't save a clip while recording — stop the recording first";
+                return;
+            }
+
             if (_replayBuffer is not { IsRunning: true })
             {
                 StatusText = "Replay buffer is not running";
@@ -547,10 +588,29 @@ namespace Fragment.ViewModels
                     NotificationService.ShowRecordingSaved(outputPath);
                 }
 
+                ResumeBufferIfPaused();
                 RefreshCanExecute();
             }
 
             Application.Current?.Dispatcher.Invoke(Apply);
+        }
+
+        // Restart the replay buffer if we paused it for a direct recording.
+        private void ResumeBufferIfPaused()
+        {
+            if (!_resumeBufferAfterRecording || _disposed)
+            {
+                return;
+            }
+
+            _resumeBufferAfterRecording = false;
+
+            // Only restart if it isn't already running — the user may have manually re-enabled the
+            // buffer during the recording, and Start() throws "already running".
+            if (_replayBuffer is { IsRunning: false })
+            {
+                StartReplayBuffer();
+            }
         }
 
         private void OnReplayBufferStopped(object? sender, EventArgs e)
@@ -575,6 +635,7 @@ namespace Fragment.ViewModels
                 IsRecording = false;
                 _timer.Stop();
                 StatusText = $"Error: {message}";
+                ResumeBufferIfPaused();
                 RefreshCanExecute();
             }
 

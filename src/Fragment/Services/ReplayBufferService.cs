@@ -32,6 +32,8 @@ public sealed class ReplayBufferService
     private string? _bufferDir;
     private RecordingProfile? _profile;
     private LoopbackCapturePipe? _loopback;
+    private WgcCapture? _wgc;      // live WGC session; MUST be disposed to remove the yellow capture border
+    private WgcFramePump? _pump;   // feeds WGC frames into ffmpeg stdin (null on the gdigrab path)
 
     public ReplayBufferService(string ffmpegPath)
     {
@@ -101,7 +103,19 @@ public sealed class ReplayBufferService
             }
         }
 
-        var arguments = BuildBufferArguments(profile, bufferDir, wrap, loopbackInfo);
+        // GPU capture via WGC (catches hardware-overlay/MPO content gdigrab/ddagrab miss); falls back
+        // to gdigrab if WGC can't capture this source. Video rides a named pipe so stdin stays free
+        // for the graceful 'q' stop.
+        var wgcDims = ScreenRecorder.TryStartWgc(profile, out var wgc);
+        WgcFramePump? pump = null;
+        (int Width, int Height, string Pipe)? wgcArg = null;
+        if (wgc != null && wgcDims is { } dd)
+        {
+            pump = new WgcFramePump(wgc, profile.Fps > 0 ? profile.Fps : 60, dd.Width, dd.Height);
+            wgcArg = (dd.Width, dd.Height, pump.FfmpegInputPath);
+        }
+
+        var arguments = BuildBufferArguments(profile, bufferDir, wrap, loopbackInfo, wgcArg);
 
         var startInfo = new ProcessStartInfo
         {
@@ -116,7 +130,7 @@ public sealed class ReplayBufferService
 
         var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
         var sessionLoopback = _loopback;
-        process.Exited += (_, _) => OnBufferExited(process, sessionLoopback, bufferDir);
+        process.Exited += (_, _) => OnBufferExited(process, sessionLoopback, bufferDir, wgc, pump);
 
         // Publish under the lock before Start() so an instant exit's handler sees this session.
         lock (_gate)
@@ -124,6 +138,8 @@ public sealed class ReplayBufferService
             _process = process;
             _bufferDir = bufferDir;
             _profile = profile;
+            _wgc = wgc;
+            _pump = pump;
         }
 
         try
@@ -142,9 +158,13 @@ public sealed class ReplayBufferService
             {
                 if (ReferenceEquals(_process, process)) { _process = null; _bufferDir = null; }
                 _loopback = null;
+                _wgc = null;
+                _pump = null;
             }
             try { process.Dispose(); } catch { }
             sessionLoopback?.Dispose();
+            try { pump?.Stop(); } catch { }
+            try { wgc?.Dispose(); } catch { }
             TryDeleteDirectory(bufferDir);
             throw new InvalidOperationException("Failed to start the replay buffer ffmpeg process.", ex);
         }
@@ -157,7 +177,7 @@ public sealed class ReplayBufferService
     public event EventHandler? Stopped;
 
     // Bound to a specific session; disposes only that session's own resources.
-    private void OnBufferExited(Process process, LoopbackCapturePipe? loopback, string? dir)
+    private void OnBufferExited(Process process, LoopbackCapturePipe? loopback, string? dir, WgcCapture? wgc, WgcFramePump? pump)
     {
         bool wasCurrent;
         lock (_gate)
@@ -168,11 +188,15 @@ public sealed class ReplayBufferService
                 _process = null;
                 if (ReferenceEquals(_loopback, loopback)) { _loopback = null; }
                 _bufferDir = null;
+                _wgc = null;
+                _pump = null;
             }
         }
 
         try { process.Dispose(); } catch { }
         loopback?.Dispose();
+        try { pump?.Stop(); } catch { }
+        try { wgc?.Dispose(); } catch { } // bound to this session, so always release it
 
         if (wasCurrent)
         {
@@ -189,6 +213,8 @@ public sealed class ReplayBufferService
         Process? process;
         LoopbackCapturePipe? loopback;
         string? bufferDir;
+        WgcCapture? wgc;
+        WgcFramePump? pump;
         lock (_gate)
         {
             process = _process;
@@ -197,11 +223,17 @@ public sealed class ReplayBufferService
             _loopback = null;
             bufferDir = _bufferDir;
             _bufferDir = null;
+            wgc = _wgc;
+            _wgc = null;
+            pump = _pump;
+            _pump = null;
         }
 
         if (process is null)
         {
             loopback?.Dispose();
+            try { pump?.Stop(); } catch { }
+            try { wgc?.Dispose(); } catch { }
             TryDeleteDirectory(bufferDir);
             return;
         }
@@ -212,6 +244,8 @@ public sealed class ReplayBufferService
             {
                 try
                 {
+                    // 'q' finalizes the last segment cleanly. WGC video rides a named pipe, not stdin,
+                    // so 'q' works on both paths (and stops the still-open live audio inputs too).
                     process.StandardInput.WriteLine("q");
                     process.StandardInput.Flush();
                 }
@@ -235,6 +269,11 @@ public sealed class ReplayBufferService
         {
             try { process.Dispose(); } catch { }
             loopback?.Dispose();
+            // Order matters: stop/join the pump thread (it reads from the capture) BEFORE disposing
+            // the WGC capture, so the pump never touches a freed D3D context. Disposing the capture
+            // also disposes its GraphicsCaptureSession, which is what clears the yellow border.
+            try { pump?.Stop(); } catch { } // release the video pipe + pump thread
+            try { wgc?.Dispose(); } catch { } // dispose the WGC session -> removes the capture border
             TryDeleteDirectory(bufferDir); // reclaim the rolling .ts segments
         }
     }
@@ -372,13 +411,14 @@ public sealed class ReplayBufferService
     /// Builds the segment-muxer command: capture the screen (and audio) and write a rolling ring of
     /// fixed-length .ts segments. <c>-segment_wrap</c> caps the number of files on disk.
     /// </summary>
-    private static string BuildBufferArguments(RecordingProfile profile, string bufferDir, int wrap, LoopbackInfo? loopback)
+    private static string BuildBufferArguments(RecordingProfile profile, string bufferDir, int wrap,
+                                               LoopbackInfo? loopback, (int Width, int Height, string Pipe)? wgc)
     {
         var sb = new StringBuilder();
         sb.Append("-hide_banner -loglevel error -y");
 
         // Reuse the recorder's input + encoding logic by building the capture portion here.
-        AppendCapture(sb, profile, loopback);
+        AppendCapture(sb, profile, loopback, wgc);
 
         // Segment muxer: rolling, wrapping, fixed-duration TS files. reset_timestamps keeps each
         // segment independently playable / concatenatable.
@@ -422,11 +462,24 @@ public sealed class ReplayBufferService
     /// Audio (when present) is mixed/mapped; output is forced to a TS-friendly codec set
     /// (H.264 + AAC) so segments concatenate cleanly regardless of profile container.
     /// </summary>
-    private static void AppendCapture(StringBuilder sb, RecordingProfile profile, LoopbackInfo? loopback)
+    private static void AppendCapture(StringBuilder sb, RecordingProfile profile, LoopbackInfo? loopback,
+                                      (int Width, int Height, string Pipe)? wgc)
     {
         var fps = profile.Fps > 0 ? profile.Fps : 60;
 
         // ---- Video input ----
+        if (wgc is { } dims)
+        {
+            // Frames come from in-app WGC capture, streamed as raw BGRA over a named pipe (WgcFramePump).
+            // -thread_queue_size keeps the video reader draining the pipe even when audio is busy.
+            sb.Append(" -thread_queue_size 512 -f rawvideo -pixel_format bgra -video_size ")
+              .Append(dims.Width.ToString(CultureInfo.InvariantCulture)).Append('x')
+              .Append(dims.Height.ToString(CultureInfo.InvariantCulture))
+              .Append(" -framerate ").Append(fps.ToString(CultureInfo.InvariantCulture))
+              .Append(" -i ").Append(Quote(dims.Pipe));
+        }
+        else
+        {
         sb.Append(" -f gdigrab");
         sb.Append(" -framerate ").Append(fps.ToString(CultureInfo.InvariantCulture));
         sb.Append(" -draw_mouse ").Append(profile.CaptureCursor ? '1' : '0');
@@ -494,6 +547,7 @@ public sealed class ReplayBufferService
                 }
                 sb.Append(" -i ").Append(Quote("desktop"));
                 break;
+        }
         }
 
         // ---- Audio inputs ----
