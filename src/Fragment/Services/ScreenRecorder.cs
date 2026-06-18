@@ -13,7 +13,7 @@ namespace Fragment.Services;
 /// Drives a single ffmpeg.exe process that captures the screen (via gdigrab) and,
 /// optionally, audio (via dshow) and encodes to the configured output file.
 /// </summary>
-public sealed class ScreenRecorder
+public sealed class ScreenRecorder : IScreenRecorder
 {
     private readonly string _ffmpegPath;
     private Process? _process;
@@ -348,7 +348,7 @@ public sealed class ScreenRecorder
         }
     }
 
-    private static string ResolveOutputPath(RecordingProfile profile)
+    internal static string ResolveOutputPath(RecordingProfile profile)
     {
         var folder = string.IsNullOrWhiteSpace(profile.OutputFolder)
             ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "Fragment")

@@ -55,6 +55,13 @@ public class AppSettings
     public string Theme { get; set; } = "Dark";
 
     /// <summary>
+    /// Use the in-process all-GPU recording engine (WGC → GPU NV12 → hardware H.264/AAC → MP4) for direct
+    /// recordings instead of shelling out to ffmpeg. Near-zero CPU. Applies to MP4 full-screen/monitor
+    /// captures; other cases fall back to ffmpeg automatically.
+    /// </summary>
+    public bool UseGpuEngine { get; set; } = true;
+
+    /// <summary>
     /// Returns the profile matching <see cref="ActiveProfileName"/>, falling back
     /// to the first profile, and finally to a fresh default if the list is empty.
     /// </summary>
@@ -93,5 +100,6 @@ public class AppSettings
         MinimizeToTray = other.MinimizeToTray;
         PlaySoundOnClip = other.PlaySoundOnClip;
         Theme = other.Theme;
+        UseGpuEngine = other.UseGpuEngine;
     }
 }

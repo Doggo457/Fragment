@@ -29,7 +29,9 @@ namespace Fragment.ViewModels
 
         private readonly AppSettings _settings;
         private string? _ffmpegPath;
-        private ScreenRecorder? _recorder;
+        private ScreenRecorder? _recorder;                                   // ffmpeg engine
+        private Fragment.Services.Encoding.GpuScreenRecorder? _gpuRecorder;  // in-process all-GPU engine
+        private IScreenRecorder? _activeRecorder;                            // whichever started the current take
         private ReplayBufferService? _replayBuffer;
         private readonly HotkeyService _hotkeys;
         private readonly DispatcherTimer _timer;
@@ -183,6 +185,13 @@ namespace Fragment.ViewModels
                 _recorder.Started += OnRecorderStarted;
                 _recorder.Stopped += OnRecorderStopped;
                 _recorder.Error += OnRecorderError;
+
+                // In-process GPU engine (near-zero CPU). Shares the same VM handlers; the active one is
+                // chosen per-recording. Construction is cheap (no device created until a recording starts).
+                _gpuRecorder = new Fragment.Services.Encoding.GpuScreenRecorder();
+                _gpuRecorder.Started += OnRecorderStarted;
+                _gpuRecorder.Stopped += OnRecorderStopped;
+                _gpuRecorder.Error += OnRecorderError;
 
                 _replayBuffer = new ReplayBufferService(_ffmpegPath!);
                 _replayBuffer.Stopped += OnReplayBufferStopped;
@@ -421,14 +430,25 @@ namespace Fragment.ViewModels
             _recordTransition = true;
             try
             {
-                if (_recorder.IsRecording)
+                if (_activeRecorder is { IsRecording: true })
                 {
                     StatusText = "Stopping...";
-                    await _recorder.StopAsync();
+                    await _activeRecorder.StopAsync();
                 }
                 else
                 {
                     StatusText = "Starting...";
+
+                    var profile = ActiveProfile();
+
+                    // Pick the engine: the in-process GPU engine when enabled and it can handle this
+                    // profile (MP4 full-screen/monitor); otherwise the ffmpeg engine.
+                    IScreenRecorder chosen =
+                        _settings.UseGpuEngine && _gpuRecorder != null &&
+                        Fragment.Services.Encoding.GpuScreenRecorder.CanHandle(profile)
+                            ? _gpuRecorder
+                            : _recorder;
+                    _activeRecorder = chosen;
 
                     // Pause the buffer so only one capture runs during the recording
                     // (two simultaneous captures starve each other -> stutter). We resume
@@ -440,12 +460,12 @@ namespace Fragment.ViewModels
                         _resumeBufferAfterRecording = true;
                     }
 
-                    await _recorder.StartAsync(ActiveProfile());
+                    await chosen.StartAsync(profile);
 
                     // StartAsync reports failure via the Error event, not an exception, so if the
-                    // process never came up, resume the buffer here rather than leaving it paused
+                    // capture never came up, resume the buffer here rather than leaving it paused
                     // while waiting on the async callback.
-                    if (!_recorder.IsRecording)
+                    if (!chosen.IsRecording)
                     {
                         ResumeBufferIfPaused();
                     }
@@ -819,13 +839,19 @@ namespace Fragment.ViewModels
                 _recorder.Started -= OnRecorderStarted;
                 _recorder.Stopped -= OnRecorderStopped;
                 _recorder.Error -= OnRecorderError;
+            }
+            if (_gpuRecorder != null)
+            {
+                _gpuRecorder.Started -= OnRecorderStarted;
+                _gpuRecorder.Stopped -= OnRecorderStopped;
+                _gpuRecorder.Error -= OnRecorderError;
+            }
 
-                if (_recorder.IsRecording)
-                {
-                    // Finalize an in-progress recording so the file isn't corrupt.
-                    try { _recorder.StopAsync().GetAwaiter().GetResult(); }
-                    catch { /* best effort on shutdown */ }
-                }
+            if (_activeRecorder is { IsRecording: true })
+            {
+                // Finalize an in-progress recording so the file isn't corrupt.
+                try { _activeRecorder.StopAsync().GetAwaiter().GetResult(); }
+                catch { /* best effort on shutdown */ }
             }
 
             if (_replayBuffer != null)

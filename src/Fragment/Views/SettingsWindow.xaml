@@ -391,6 +391,8 @@
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
 
                         <TextBlock Grid.Row="0" Grid.ColumnSpan="3" Style="{StaticResource SectionHeader}" Text="Output &amp; files"/>
@@ -418,6 +420,11 @@
                         <CheckBox Grid.Row="5" Grid.Column="1"
                                   Content="Minimize to system tray"
                                   IsChecked="{Binding MinimizeToTray}"/>
+
+                        <CheckBox Grid.Row="6" Grid.Column="1"
+                                  Content="GPU recording engine (near-zero CPU)"
+                                  ToolTip="In-process all-GPU capture+encode for MP4 full-screen/monitor recordings. Other cases use ffmpeg."
+                                  IsChecked="{Binding UseGpuEngine}"/>
                     </Grid>
                 </ScrollViewer>
             </TabItem>

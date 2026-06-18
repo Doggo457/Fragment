@@ -340,6 +340,12 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         set { if (_settings.MinimizeToTray != value) { _settings.MinimizeToTray = value; OnPropertyChanged(); } }
     }
 
+    public bool UseGpuEngine
+    {
+        get => _settings.UseGpuEngine;
+        set { if (_settings.UseGpuEngine != value) { _settings.UseGpuEngine = value; OnPropertyChanged(); } }
+    }
+
     public string Theme
     {
         get => _settings.Theme;
