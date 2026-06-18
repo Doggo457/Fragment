@@ -12,6 +12,15 @@ public partial class App : Application
 {
     protected override void OnStartup(StartupEventArgs e)
     {
+        // Headless GPU-engine self-test: run, write a log, and exit without showing the UI.
+        var gpuTest = Environment.GetEnvironmentVariable("FRAGMENT_GPUTEST");
+        if (!string.IsNullOrEmpty(gpuTest))
+        {
+            Fragment.Services.Encoding.GpuSelfTest.Run(gpuTest);
+            Shutdown(0);
+            return;
+        }
+
         base.OnStartup(e);
 
         // Surface unhandled UI-thread exceptions instead of crashing silently.
