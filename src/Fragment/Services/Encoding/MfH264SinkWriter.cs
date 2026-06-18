@@ -18,6 +18,13 @@ public sealed class MfH264SinkWriter : IDisposable
     private const uint MFVideoInterlace_Progressive = 2;
     private const uint eAVEncH264VProfile_High = 100;
 
+    // ICodecAPI properties (passed to the encoder via SetInputMediaType's encodingParameters) so the
+    // hardware encoder honours a target bitrate instead of its default quality-VBR (which over-shoots).
+    private static readonly Guid CODECAPI_AVEncCommonRateControlMode = new("1c0608e9-370c-4710-8a58-cb6181c42423");
+    private static readonly Guid CODECAPI_AVEncCommonMeanBitRate = new("f7222374-2144-4815-b550-a37f8e12ee52");
+    private static readonly Guid CODECAPI_AVEncMPVGOPSize = new("95f31b26-95a4-41aa-9303-246a7fc6eef1");
+    private const uint eAVEncCommonRateControlMode_UnconstrainedVBR = 2; // target the mean; efficient for screen content
+
     private readonly IMFSinkWriter _writer;
     private readonly int _stream;
     private bool _finalized;
@@ -53,7 +60,13 @@ public sealed class MfH264SinkWriter : IDisposable
         SetRatio(inType, MediaTypeAttributeKeys.FrameSize, width, height);
         SetRatio(inType, MediaTypeAttributeKeys.FrameRate, fps, 1);
         SetRatio(inType, MediaTypeAttributeKeys.PixelAspectRatio, 1, 1);
-        _writer.SetInputMediaType(_stream, inType, null);
+
+        // Encoder config: VBR targeting the requested bitrate, ~2 s keyframe interval.
+        using var enc = MediaFactory.MFCreateAttributes(3);
+        enc.Set(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_UnconstrainedVBR);
+        enc.Set(CODECAPI_AVEncCommonMeanBitRate, (uint)bitrate);
+        enc.Set(CODECAPI_AVEncMPVGOPSize, (uint)(fps * 2));
+        _writer.SetInputMediaType(_stream, inType, enc);
 
         _writer.BeginWriting();
     }
