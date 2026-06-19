@@ -32,7 +32,9 @@ namespace Fragment.ViewModels
         private ScreenRecorder? _recorder;                                   // ffmpeg engine
         private Fragment.Services.Encoding.GpuScreenRecorder? _gpuRecorder;  // in-process all-GPU engine
         private IScreenRecorder? _activeRecorder;                            // whichever started the current take
-        private ReplayBufferService? _replayBuffer;
+        private ReplayBufferService? _replayBuffer;                              // ffmpeg replay buffer
+        private Fragment.Services.Encoding.GpuReplayBuffer? _gpuReplayBuffer;     // in-process GPU replay buffer
+        private IReplayBuffer? _activeReplay;                                     // whichever buffer is currently live
         private readonly HotkeyService _hotkeys;
         private readonly DispatcherTimer _timer;
 
@@ -79,7 +81,7 @@ namespace Fragment.ViewModels
 
             StartStopCommand = new RelayCommand(_ => ToggleRecording(), _ => _recorder != null && !_isInitializing);
             SaveClipCommand = new RelayCommand(async _ => await SaveClipAsync(),
-                _ => _replayBuffer is { IsRunning: true });
+                _ => _activeReplay is { IsRunning: true });
             ToggleReplayCommand = new RelayCommand(_ => ToggleReplay(), _ => _replayBuffer != null);
             OpenSettingsCommand = new RelayCommand(_ => OpenSettings());
             OpenEditorCommand = new RelayCommand(_ => OpenEditor());
@@ -195,6 +197,11 @@ namespace Fragment.ViewModels
 
                 _replayBuffer = new ReplayBufferService(_ffmpegPath!);
                 _replayBuffer.Stopped += OnReplayBufferStopped;
+
+                // In-process GPU replay buffer (near-zero idle CPU). Shares the same Stopped handler;
+                // StartReplayBuffer picks it per-profile when the GPU engine is enabled.
+                _gpuReplayBuffer = new Fragment.Services.Encoding.GpuReplayBuffer();
+                _gpuReplayBuffer.Stopped += OnReplayBufferStopped;
 
                 _isInitializing = false;
                 OnPropertyChanged(nameof(RecordButtonText));
@@ -453,9 +460,9 @@ namespace Fragment.ViewModels
                     // Pause the buffer so only one capture runs during the recording
                     // (two simultaneous captures starve each other -> stutter). We resume
                     // it once the recording stops.
-                    if (_replayBuffer is { IsRunning: true })
+                    if (_activeReplay is { IsRunning: true })
                     {
-                        _replayBuffer.Stop();
+                        _activeReplay.Stop();
                         IsReplayRunning = false;
                         _resumeBufferAfterRecording = true;
                     }
@@ -504,7 +511,8 @@ namespace Fragment.ViewModels
                 return;
             }
 
-            if (_replayBuffer is not { IsRunning: true })
+            var active = _activeReplay;
+            if (active is not { IsRunning: true })
             {
                 StatusText = "Replay buffer is not running";
                 return;
@@ -516,7 +524,7 @@ namespace Fragment.ViewModels
                 var profile = ActiveProfile();
                 string outputPath = BuildOutputPath(profile, "Clip");
 
-                string? saved = await _replayBuffer.SaveClipAsync(
+                string? saved = await active.SaveClipAsync(
                     _settings.ClipLengthSeconds, outputPath);
 
                 StatusText = saved != null
@@ -544,9 +552,9 @@ namespace Fragment.ViewModels
 
             try
             {
-                if (_replayBuffer.IsRunning)
+                if (_activeReplay is { IsRunning: true } active)
                 {
-                    _replayBuffer.Stop();
+                    active.Stop();
                     IsReplayRunning = false;
                     StatusText = "Replay buffer stopped";
                 }
@@ -570,11 +578,35 @@ namespace Fragment.ViewModels
                 return;
             }
 
+            var profile = ActiveProfile();
+            // Use the GPU replay buffer when enabled and it can handle this profile; else ffmpeg.
+            bool useGpu = _settings.UseGpuEngine && _gpuReplayBuffer != null &&
+                          Fragment.Services.Encoding.GpuReplayBuffer.CanHandle(profile);
+            IReplayBuffer chosen = useGpu ? _gpuReplayBuffer! : _replayBuffer;
+
             try
             {
-                _replayBuffer.Start(ActiveProfile(), _settings.ReplayBufferSeconds);
-                IsReplayRunning = _replayBuffer.IsRunning;
+                chosen.Start(profile, _settings.ReplayBufferSeconds);
+                _activeReplay = chosen;
+                IsReplayRunning = chosen.IsRunning;
                 StatusText = IsReplayRunning ? "Replay buffer running" : StatusText;
+            }
+            catch (Exception ex) when (useGpu)
+            {
+                // GPU buffer failed to start — fall back to ffmpeg so the buffer still runs.
+                try
+                {
+                    _replayBuffer.Start(profile, _settings.ReplayBufferSeconds);
+                    _activeReplay = _replayBuffer;
+                    IsReplayRunning = _replayBuffer.IsRunning;
+                    StatusText = IsReplayRunning ? "Replay buffer running (ffmpeg)" : StatusText;
+                }
+                catch (Exception ex2)
+                {
+                    IsReplayRunning = false;
+                    StatusText = $"Replay error: {ex2.Message}";
+                }
+                _ = ex;
             }
             catch (Exception ex)
             {
@@ -709,9 +741,9 @@ namespace Fragment.ViewModels
 
             _resumeBufferAfterRecording = false;
 
-            // Only restart if it isn't already running — the user may have manually re-enabled the
+            // Only restart if nothing is already running — the user may have manually re-enabled the
             // buffer during the recording, and Start() throws "already running".
-            if (_replayBuffer is { IsRunning: false })
+            if (_activeReplay is null or { IsRunning: false })
             {
                 StartReplayBuffer();
             }
@@ -864,12 +896,10 @@ namespace Fragment.ViewModels
                 catch { /* best effort on shutdown */ }
             }
 
-            if (_replayBuffer != null)
-            {
-                _replayBuffer.Stopped -= OnReplayBufferStopped;
-                try { _replayBuffer.Stop(); }
-                catch { /* best effort */ }
-            }
+            if (_replayBuffer != null) _replayBuffer.Stopped -= OnReplayBufferStopped;
+            if (_gpuReplayBuffer != null) _gpuReplayBuffer.Stopped -= OnReplayBufferStopped;
+            try { _activeReplay?.Stop(); } catch { /* best effort */ }
+            try { _gpuReplayBuffer?.Dispose(); } catch { }
 
             _hotkeys.HotkeyPressed -= OnHotkeyPressed;
             _hotkeys.Dispose();
