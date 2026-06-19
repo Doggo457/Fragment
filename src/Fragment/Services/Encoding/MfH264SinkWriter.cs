@@ -106,7 +106,7 @@ public sealed class MfH264SinkWriter : IDisposable
     }
 
     // The MF AAC encoder only accepts a fixed set of output byte-rates; snap to the nearest.
-    private static int SnapAacBytesPerSec(int bitsPerSec)
+    internal static int SnapAacBytesPerSec(int bitsPerSec)
     {
         int target = bitsPerSec / 8;
         int[] valid = { 12000, 16000, 20000, 24000 };

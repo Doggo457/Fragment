@@ -17,7 +17,7 @@ namespace Fragment.Services;
 /// stitches the most recent segments together with the concat demuxer to produce a clip covering
 /// roughly the last N seconds.
 /// </summary>
-public sealed class ReplayBufferService
+public sealed class ReplayBufferService : IReplayBuffer
 {
     /// <summary>Length of each rolling segment, in seconds. Smaller = finer clip granularity.</summary>
     private const int SegmentSeconds = 2;

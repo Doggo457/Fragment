@@ -26,7 +26,9 @@ internal static class GpuSelfTest
 
         try
         {
-            if (mode == "3") RunRecord(W);
+            if (mode == "5") RunReplayBuffer(W);
+            else if (mode == "4") RunEncoderMft(W);
+            else if (mode == "3") RunRecord(W);
             else if (mode == "2") RunCaptureConvert(W);
             else RunDeviceOnly(W);
         }
@@ -103,6 +105,128 @@ internal static class GpuSelfTest
         var fi = new FileInfo(outPath);
         W(fi.Exists ? $"wrote gpu_record.mp4 ({fi.Length:N0} bytes)" : "RESULT: FAIL - file missing");
         if (fi.Exists && fi.Length > 0) W("RESULT: PASS");
+    }
+
+    // Phase 5: always-on GPU replay buffer -> save a GOP-aligned clip.
+    private static void RunReplayBuffer(Action<string> W)
+    {
+        string outPath = Path.Combine(Dir, "gpu_clip.mp4");
+        try { File.Delete(outPath); } catch { }
+
+        var profile = new Fragment.Models.RecordingProfile
+        {
+            Source = Fragment.Models.CaptureSource.FullScreen,
+            Container = Fragment.Models.OutputContainer.Mp4,
+            Fps = 60,
+            VideoBitrateKbps = 16000,
+            AudioBitrateKbps = 160,
+            Audio = Fragment.Models.AudioMode.SystemOnly,
+            CaptureCursor = true,
+        };
+
+        using var buf = new GpuReplayBuffer { Diag = W };
+        var proc = System.Diagnostics.Process.GetCurrentProcess();
+        W("starting replay buffer (15s window)...");
+        buf.Start(profile, bufferSeconds: 15);
+        W($"IsRunning={buf.IsRunning}");
+
+        var cpu0 = proc.TotalProcessorTime;
+        var wall = System.Diagnostics.Stopwatch.StartNew();
+        System.Threading.Thread.Sleep(12000); // accumulate footage
+        double cpuMs = (proc.TotalProcessorTime - cpu0).TotalMilliseconds;
+        double wallMs = wall.Elapsed.TotalMilliseconds;
+        W($"idle CPU while buffering: {cpuMs / wallMs * 100:F1}% of 1 core ({cpuMs / wallMs / Environment.ProcessorCount * 100:F2}% of {Environment.ProcessorCount} cores)");
+
+        W("saving 8s clip...");
+        string? saved = buf.SaveClipAsync(8, outPath).GetAwaiter().GetResult();
+        W($"SaveClipAsync returned: {(saved ?? "null")}");
+
+        buf.Stop();
+        W($"IsRunning after stop={buf.IsRunning}");
+
+        var fi = new FileInfo(outPath);
+        if (saved != null && fi.Exists && fi.Length > 0)
+        {
+            W($"wrote gpu_clip.mp4 ({fi.Length:N0} bytes)");
+            W("RESULT: PASS");
+        }
+        else W("RESULT: FAIL - no clip produced");
+    }
+
+    // Step 1+2 isolation: real capture -> NV12 -> hardware H.264 encoder MFT (direct), count samples/keyframes.
+    private static void RunEncoderMft(Action<string> W)
+    {
+        const int Fps = 60, Pool = 12;
+        using var gpu = new GpuRecordingDevice();
+        IntPtr hmon = WgcCapture.MonitorFromPoint(0, 0);
+        using var cap = new GpuWgcCapture(gpu, hmon, captureCursor: true);
+        if (!cap.WaitForFirstFrame(5000, out int w, out int h)) { W("RESULT: FAIL - no frame"); return; }
+        using var conv = new VideoProcessorConverter(gpu, w, h, Fps);
+
+        long totalBytes = 0;
+        var keyTimes = new System.Collections.Generic.List<long>();
+        var firstFrames = new System.Collections.Generic.List<string>();
+        using var enc = new MfH264EncoderMft(gpu, conv.Width, conv.Height, Fps, 16_000_000, s =>
+        {
+            System.Threading.Interlocked.Add(ref totalBytes, s.Data.Length);
+            lock (keyTimes) { if (s.KeyFrame) keyTimes.Add(s.TimeNs); if (firstFrames.Count < 6) firstFrames.Add($"{(s.KeyFrame ? "KEY" : "   ")} t={s.TimeNs / 10000}ms {s.Data.Length}B"); }
+        });
+        W($"encoder created: {conv.Width}x{conv.Height}@{Fps}");
+
+        var input = new ID3D11Texture2D[Pool];
+        var nv12 = new ID3D11Texture2D[Pool];
+        for (int i = 0; i < Pool; i++) { input[i] = conv.CreateInputTexture(); nv12[i] = conv.CreateNv12Texture(); }
+
+        var proc = System.Diagnostics.Process.GetCurrentProcess();
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        long freq = System.Diagnostics.Stopwatch.Frequency;
+        long frame = 0, submitted = 0, dropped = 0;
+        var cpu0 = proc.TotalProcessorTime;
+
+        while (clock.Elapsed.TotalSeconds < 10)
+        {
+            long deadline = frame * freq / Fps;
+            long now = clock.ElapsedTicks;
+            if (deadline > now) { int ms = (int)((deadline - now) * 1000 / freq); if (ms > 0) System.Threading.Thread.Sleep(ms); }
+
+            int slot = (int)(frame % Pool);
+            if (cap.CopyLatestInto(input[slot]))
+            {
+                conv.Convert(input[slot], nv12[slot]);
+                gpu.Context.Flush();
+                if (enc.TryConsumeNeedInput())
+                {
+                    long ts = clock.Elapsed.Ticks;
+                    enc.SubmitFrame(nv12[slot], ts, 10_000_000L / Fps);
+                    submitted++;
+                }
+                else { dropped++; }
+            }
+            frame++;
+        }
+
+        double cpuMs = (proc.TotalProcessorTime - cpu0).TotalMilliseconds;
+        enc.Drain();
+        System.Threading.Thread.Sleep(200);
+
+        foreach (var f in firstFrames) W("  " + f);
+        // keyframe interval stats
+        string kf = "n/a";
+        lock (keyTimes)
+        {
+            if (keyTimes.Count >= 2)
+            {
+                long span = keyTimes[^1] - keyTimes[0];
+                kf = $"{keyTimes.Count} keyframes over {span / 10000}ms (~every {span / 10000 / (keyTimes.Count - 1)}ms)";
+            }
+            else kf = $"{keyTimes.Count} keyframes seen";
+        }
+        W($"submitted={submitted} dropped={dropped} samplesOut={enc.SamplesOut} keyOut={enc.KeyFramesOut} bytes={totalBytes:N0}");
+        W($"keyframes: {kf}");
+        W($"CPU: {cpuMs / 10000.0:F1}% of 1 core ({cpuMs / 10000.0 / Environment.ProcessorCount:F2}% of {Environment.ProcessorCount} cores)");
+
+        for (int i = 0; i < Pool; i++) { try { input[i].Dispose(); } catch { } try { nv12[i].Dispose(); } catch { } }
+        W(enc.SamplesOut > 0 && enc.KeyFramesOut > 0 ? "RESULT: PASS" : "RESULT: FAIL - no encoded samples/keyframes");
     }
 
     // --- read-back + PNG helpers (TEST ONLY; the real pipeline never reads back) ---
