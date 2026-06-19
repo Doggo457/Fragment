@@ -118,6 +118,11 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
             }
             catch (Exception ex)
             {
+                // Stop + join the feeder (it may already be running) BEFORE TearDown disposes the D3D
+                // device / encoder it uses — otherwise the live feeder races teardown (use-after-dispose).
+                _running = false;
+                try { _feeder?.Join(3000); } catch { }
+                _feeder = null;
                 TearDown();
                 throw new InvalidOperationException("Failed to start the GPU replay buffer.", ex);
             }
@@ -267,11 +272,15 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
             }
 
             releaseNow = false; // the Task owns the gate now
-            return Task.Run(() =>
+            try
             {
-                try { MuxClip(outputPath, vType!, video, audio, startVideoNs); return (string?)outputPath; }
-                finally { _saveGate.Release(); }
-            });
+                return Task.Run(() =>
+                {
+                    try { MuxClip(outputPath, vType!, video, audio, startVideoNs); return (string?)outputPath; }
+                    finally { _saveGate.Release(); }
+                });
+            }
+            catch { _saveGate.Release(); throw; } // scheduling failure: don't leak the gate
         }
         finally { if (releaseNow) _saveGate.Release(); }
     }

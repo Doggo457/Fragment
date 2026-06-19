@@ -252,6 +252,7 @@ public sealed class MfH264EncoderMft : IDisposable
         // Ordered async-MFT shutdown that also unblocks the event thread's blocking GetEvent:
         // EndOfStream -> Drain (the MFT emits remaining outputs then DrainComplete, which wakes GetEvent and
         // makes the event loop exit) -> join -> EndStreaming -> release.
+        bool joined = false;
         try
         {
             _drainDone.Reset();
@@ -261,12 +262,13 @@ public sealed class MfH264EncoderMft : IDisposable
                 try { _mft.ProcessMessage(TMessageType.MessageCommandDrain, UIntPtr.Zero); } catch { }
             }
 
-            if (_eventThread != null && !_eventThread.Join(3000))
+            joined = _eventThread == null || _eventThread.Join(3000);
+            if (!joined)
             {
                 // Device-loss / no DrainComplete: force the blocked GetEvent to return by tearing down the
-                // generator, then join again.
+                // generator, then wait again (the thread exits once GetEvent throws / ProcessOutput returns).
                 try { _events.Dispose(); } catch { }
-                try { _eventThread.Join(1000); } catch { }
+                joined = _eventThread!.Join(2000);
             }
         }
         catch { }
@@ -274,7 +276,13 @@ public sealed class MfH264EncoderMft : IDisposable
         try { lock (_transformLock) _mft.ProcessMessage(TMessageType.MessageNotifyEndStreaming, UIntPtr.Zero); } catch { }
         try { _events.Dispose(); } catch { }
         try { lock (_typeLock) _outputType?.Dispose(); } catch { }
-        try { _mft.Dispose(); } catch { }
-        _drainDone.Dispose();
+
+        // Only release the MFT/event once the event thread is definitely gone. If a faulted driver never
+        // returned from ProcessOutput, leak them rather than risk a use-after-free crash (rare + safe).
+        if (joined)
+        {
+            try { _mft.Dispose(); } catch { }
+            _drainDone.Dispose();
+        }
     }
 }
