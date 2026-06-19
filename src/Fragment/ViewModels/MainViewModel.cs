@@ -450,12 +450,11 @@ namespace Fragment.ViewModels
 
                     // Pick the engine: the in-process GPU engine when enabled and it can handle this
                     // profile (MP4 full-screen/monitor); otherwise the ffmpeg engine.
-                    IScreenRecorder chosen =
-                        _settings.UseGpuEngine && _gpuRecorder != null &&
-                        Fragment.Services.Encoding.GpuScreenRecorder.CanHandle(profile)
-                            ? _gpuRecorder
-                            : _recorder;
+                    bool recUseGpu = _settings.UseGpuEngine && _gpuRecorder != null &&
+                        Fragment.Services.Encoding.GpuScreenRecorder.CanHandle(profile);
+                    IScreenRecorder chosen = recUseGpu ? _gpuRecorder! : _recorder;
                     _activeRecorder = chosen;
+                    LogGpu($"record start: UseGpuEngine={_settings.UseGpuEngine} CanHandle={Fragment.Services.Encoding.GpuScreenRecorder.CanHandle(profile)} (container={profile.Container} source={profile.Source}) -> {(recUseGpu ? "GPU" : "ffmpeg")}");
 
                     // Pause the buffer so only one capture runs during the recording
                     // (two simultaneous captures starve each other -> stutter). We resume
@@ -473,6 +472,7 @@ namespace Fragment.ViewModels
                     // (the GPU adapter fails silently for exactly this reason).
                     if (!chosen.IsRecording && ReferenceEquals(chosen, _gpuRecorder) && _recorder != null)
                     {
+                        LogGpu("record GPU start FAILED -> ffmpeg fallback: " + (_gpuRecorder?.LastStartError ?? "(unknown)"));
                         StatusText = "GPU engine unavailable — using ffmpeg…";
                         chosen = _recorder;
                         _activeRecorder = chosen;
@@ -571,6 +571,19 @@ namespace Fragment.ViewModels
             RefreshCanExecute();
         }
 
+        // Appends a line to %TEMP%\Fragment\gpu_engine.log so we can see which engine each action used.
+        private static void LogGpu(string msg)
+        {
+            try
+            {
+                var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "Fragment");
+                System.IO.Directory.CreateDirectory(dir);
+                System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "gpu_engine.log"),
+                    $"{DateTime.Now:HH:mm:ss} {msg}{Environment.NewLine}");
+            }
+            catch { }
+        }
+
         private void StartReplayBuffer()
         {
             if (_replayBuffer == null)
@@ -583,30 +596,31 @@ namespace Fragment.ViewModels
             bool useGpu = _settings.UseGpuEngine && _gpuReplayBuffer != null &&
                           Fragment.Services.Encoding.GpuReplayBuffer.CanHandle(profile);
             IReplayBuffer chosen = useGpu ? _gpuReplayBuffer! : _replayBuffer;
+            LogGpu($"replay-buffer start: UseGpuEngine={_settings.UseGpuEngine} CanHandle={Fragment.Services.Encoding.GpuReplayBuffer.CanHandle(profile)} (container={profile.Container} source={profile.Source}) -> {(useGpu ? "GPU" : "ffmpeg")}");
 
             try
             {
                 chosen.Start(profile, _settings.ReplayBufferSeconds);
                 _activeReplay = chosen;
                 IsReplayRunning = chosen.IsRunning;
-                StatusText = IsReplayRunning ? "Replay buffer running" : StatusText;
+                StatusText = IsReplayRunning ? (useGpu ? "Replay buffer running — GPU" : "Replay buffer running — ffmpeg") : StatusText;
             }
             catch (Exception ex) when (useGpu)
             {
                 // GPU buffer failed to start — fall back to ffmpeg so the buffer still runs.
+                LogGpu("replay-buffer GPU start FAILED -> ffmpeg fallback: " + ex.Message);
                 try
                 {
                     _replayBuffer.Start(profile, _settings.ReplayBufferSeconds);
                     _activeReplay = _replayBuffer;
                     IsReplayRunning = _replayBuffer.IsRunning;
-                    StatusText = IsReplayRunning ? "Replay buffer running (ffmpeg)" : StatusText;
+                    StatusText = IsReplayRunning ? "Replay buffer running — ffmpeg (GPU failed)" : StatusText;
                 }
                 catch (Exception ex2)
                 {
                     IsReplayRunning = false;
                     StatusText = $"Replay error: {ex2.Message}";
                 }
-                _ = ex;
             }
             catch (Exception ex)
             {
@@ -699,7 +713,8 @@ namespace Fragment.ViewModels
                 _recordStartedUtc = DateTime.UtcNow;
                 RecordTimer = "00:00:00";
                 _timer.Start();
-                StatusText = "Recording";
+                StatusText = _activeRecorder is Fragment.Services.Encoding.GpuScreenRecorder
+                    ? "Recording — GPU engine" : "Recording — ffmpeg";
                 RefreshCanExecute();
             }
 

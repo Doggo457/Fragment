@@ -90,6 +90,10 @@ public sealed class MfH264EncoderMft : IDisposable
                 _mft.SetInputType(0, inType, 0);
             }
 
+            // Honour the requested bitrate. Setting CODECAPI on the MFT attribute store is ignored by the
+            // AMD encoder; the working path is ICodecAPI (QI'd via COM interop since Vortice lacks it).
+            SetRateControl(bitrate, fps);
+
             _outputType = _mft.GetOutputCurrentType(0);
             _events = _mft.QueryInterface<IMFMediaEventGenerator>();
 
@@ -140,6 +144,31 @@ public sealed class MfH264EncoderMft : IDisposable
 
     private static void SetRatio(IMFMediaType t, Guid key, int hi, int lo)
         => t.Set(key, ((ulong)(uint)hi << 32) | (uint)lo);
+
+    // Configure rate control through ICodecAPI (the encoder exposes it; Vortice doesn't bind it, so we
+    // QI the raw COM interface). UnconstrainedVBR targeting the mean bitrate -> efficient, honours the slider.
+    private void SetRateControl(int bitrate, int fps)
+    {
+        object? rcw = null;
+        try
+        {
+            rcw = Marshal.GetObjectForIUnknown(_mft.NativePointer);
+            if (rcw is ICodecAPI codec)
+            {
+                CodecSet(codec, CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_UnconstrainedVBR);
+                CodecSet(codec, CODECAPI_AVEncCommonMeanBitRate, (uint)bitrate);
+                CodecSet(codec, CODECAPI_AVEncMPVGOPSize, (uint)fps); // 1 s GOP: tight replay-clip lengths
+            }
+        }
+        catch { /* no ICodecAPI -> encoder keeps its default rate control */ }
+        finally { if (rcw != null) { try { Marshal.ReleaseComObject(rcw); } catch { } } }
+    }
+
+    private static void CodecSet(ICodecAPI codec, Guid api, uint value)
+    {
+        object v = value; // boxed uint -> VARIANT VT_UI4
+        try { codec.SetValue(ref api, ref v); } catch { }
+    }
 
     /// <summary>Returns an independent copy of the encoder's negotiated output type (SPS/PPS) for the save muxer.</summary>
     public IMFMediaType CloneOutputType()
@@ -242,6 +271,20 @@ public sealed class MfH264EncoderMft : IDisposable
             }
             finally { try { sample.Dispose(); } catch { } }
         }
+    }
+
+    // Minimal ICodecAPI binding (Vortice doesn't expose it). Only SetValue is called; the methods before
+    // it are vtable placeholders so SetValue lands at the correct slot.
+    [ComImport, Guid("901db4c7-31ce-41a2-85dc-8fa0bf41b8da"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface ICodecAPI
+    {
+        void IsSupported();
+        void IsModifiable();
+        void GetParameterRange();
+        void GetParameterValues();
+        void GetDefaultValue();
+        void GetValue();
+        [PreserveSig] int SetValue([In] ref Guid Api, [In, MarshalAs(UnmanagedType.Struct)] ref object Value);
     }
 
     public void Dispose()
