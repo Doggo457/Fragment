@@ -259,6 +259,10 @@
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
                             <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
                         </Grid.RowDefinitions>
 
                         <TextBlock Grid.Row="0" Grid.ColumnSpan="3" Style="{StaticResource SectionHeader}" Text="Audio capture"/>
@@ -323,6 +327,41 @@
                                 IsEnabled="{Binding UsesMic}"/>
                         <TextBox Grid.Row="9" Grid.Column="2" Text="{Binding MicNoiseSuppressionStrength}"
                                  IsEnabled="{Binding UsesMic}"/>
+
+                        <!-- Live monitor: hear the processed mic and watch the level vs the gate threshold -->
+                        <TextBlock Grid.Row="10" Grid.Column="0" Style="{StaticResource LabelText}" Text="Hear your mic"/>
+                        <StackPanel Grid.Row="10" Grid.Column="1" Grid.ColumnSpan="2" Orientation="Horizontal">
+                            <Button Content="{Binding MonitorButtonText}"
+                                    Style="{StaticResource DialogButton}"
+                                    Margin="0,6,0,6" Padding="16,7"
+                                    Command="{Binding ToggleMonitorCommand}"
+                                    IsEnabled="{Binding UsesMic}"
+                                    ToolTip="Play your microphone through the speakers with the current cleanup applied, so you can hear where to set the gate and suppression."/>
+                        </StackPanel>
+
+                        <TextBlock Grid.Row="11" Grid.Column="1" Grid.ColumnSpan="2"
+                                   Foreground="{StaticResource SubtleTextBrush}"
+                                   FontSize="11" TextWrapping="Wrap" Margin="0,0,0,4"
+                                   Text="{Binding MonitorStatus}"/>
+
+                        <TextBlock Grid.Row="12" Grid.Column="0" Style="{StaticResource LabelText}" Text="Mic level"/>
+                        <Border x:Name="MicMeterTrack" Grid.Row="12" Grid.Column="1" Grid.ColumnSpan="2"
+                                Height="16" CornerRadius="3" Background="#12151C"
+                                BorderBrush="{StaticResource BorderBrush}" BorderThickness="1"
+                                HorizontalAlignment="Stretch" Margin="0,6"
+                                ToolTip="Level the gate sees (after suppression). Green = above the gate (mic open); the line marks the gate threshold.">
+                            <Grid ClipToBounds="True">
+                                <Rectangle x:Name="MicMeterFill" HorizontalAlignment="Left" Width="0"
+                                           RadiusX="2" RadiusY="2" Fill="{StaticResource AccentBrush}"/>
+                                <Rectangle x:Name="MicMeterThreshold" Width="2" HorizontalAlignment="Left"
+                                           Fill="#FFF0F4FF" Opacity="0.9" Visibility="Collapsed"/>
+                            </Grid>
+                        </Border>
+
+                        <TextBlock Grid.Row="13" Grid.Column="1" Grid.ColumnSpan="2"
+                                   Foreground="{StaticResource SubtleTextBrush}"
+                                   FontSize="11" TextWrapping="Wrap" Margin="0,0,0,4"
+                                   Text="Aim the gate threshold just above your background noise but below your voice. Use headphones — speaker sound can feed back into the mic."/>
                     </Grid>
                 </ScrollViewer>
             </TabItem>

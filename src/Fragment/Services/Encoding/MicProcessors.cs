@@ -21,7 +21,7 @@ public sealed class NoiseGateSampleProvider : ISampleProvider
 {
     private readonly ISampleProvider _src;
     private readonly int _ch;
-    private readonly float _thresh;        // linear threshold
+    private float _thresh;                  // linear threshold (live-settable via ThresholdDb)
     private readonly float _attack, _release; // one-pole coefficients per frame
     private readonly int _hold;            // frames to hold open after dropping below threshold
     private float _gain;                   // current gain 0..1
@@ -29,13 +29,19 @@ public sealed class NoiseGateSampleProvider : ISampleProvider
 
     public WaveFormat WaveFormat => _src.WaveFormat;
 
+    /// <summary>When false the gate ramps to unity and passes audio through (to A/B it live in the monitor).</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Live-settable open threshold in dBFS; recomputes the linear threshold.</summary>
+    public float ThresholdDb { set => _thresh = (float)Math.Pow(10.0, value / 20.0); }
+
     public NoiseGateSampleProvider(ISampleProvider src, float thresholdDb,
         float attackMs = 5f, float holdMs = 150f, float releaseMs = 200f)
     {
         _src = src;
         _ch = src.WaveFormat.Channels;
         int rate = src.WaveFormat.SampleRate;
-        _thresh = (float)Math.Pow(10.0, thresholdDb / 20.0);
+        ThresholdDb = thresholdDb;
         _attack = (float)Math.Exp(-1.0 / Math.Max(1, rate * attackMs / 1000.0));
         _release = (float)Math.Exp(-1.0 / Math.Max(1, rate * releaseMs / 1000.0));
         _hold = (int)(rate * holdMs / 1000.0);
@@ -51,7 +57,8 @@ public sealed class NoiseGateSampleProvider : ISampleProvider
             for (int c = 0; c < _ch; c++) { float a = Math.Abs(buffer[offset + i + c]); if (a > lvl) lvl = a; }
 
             bool open;
-            if (lvl >= _thresh) { _holdCtr = _hold; open = true; }
+            if (!Enabled) open = true;                              // bypass: ramp to unity, no gating
+            else if (lvl >= _thresh) { _holdCtr = _hold; open = true; }
             else if (_holdCtr > 0) { _holdCtr--; open = true; }
             else open = false;
 
@@ -80,8 +87,17 @@ public sealed class SpectralNoiseSuppressor : ISampleProvider
     private readonly ISampleProvider _src; // mono
     private readonly float[] _win = new float[N];
     private readonly float _ola1; // overlap-add normalization (constant for fixed window+hop)
-    private readonly float _floorGain;
-    private readonly float _sensitivity;
+
+    /// <summary>When false the suppressor reconstructs transparently (gain mask = 1) — keeps latency constant for live A/B.</summary>
+    public bool Enabled { get; set; } = true;
+
+    // Single atomic source of truth for the live strength. The floor gain and sensitivity are derived from
+    // it once per frame on the audio thread, so a slider change can never expose a mismatched pair (the old
+    // two-field approach could be read torn across threads). One float write is atomic.
+    private volatile float _strength;
+
+    /// <summary>Live-settable strength 0..1.</summary>
+    public float Strength { set => _strength = Math.Clamp(value, 0f, 1f); }
 
     private readonly float[] _frame = new float[N];   // sliding analysis frame
     private readonly float[] _re = new float[N];
@@ -109,9 +125,7 @@ public sealed class SpectralNoiseSuppressor : ISampleProvider
             for (int i = 0; i < N; i++) acc[f * Hop + i] += _win[i] * _win[i];
         _ola1 = acc[N * 2] > 1e-6f ? acc[N * 2] : 1f;
 
-        strength = Math.Clamp(strength, 0f, 1f);
-        _floorGain = (float)Math.Pow(10.0, (-6.0 - 20.0 * strength) / 20.0); // -6 dB (weak) .. -26 dB (strong)
-        _sensitivity = 1.6f + 3.0f * strength;                               // higher = more aggressive
+        Strength = strength;
     }
 
     public int Read(float[] buffer, int offset, int count)
@@ -160,13 +174,19 @@ public sealed class SpectralNoiseSuppressor : ISampleProvider
         for (int i = 0; i < N; i++) { _re[i] = _frame[i] * _win[i]; _im[i] = 0f; }
         Fft(_re, _im, false);
 
+        // Snapshot the live params once per frame so the whole frame uses a consistent (floor, sensitivity) pair.
+        float strength = _strength;
+        float floorGain = (float)Math.Pow(10.0, (-6.0 - 20.0 * strength) / 20.0); // -6 dB (weak) .. -26 dB (strong)
+        float sensitivity = 1.6f + 3.0f * strength;                               // higher = more aggressive
+        bool enabled = Enabled;
+
         for (int b = 0; b < Bins; b++)
         {
             float mag = (float)Math.Sqrt(_re[b] * _re[b] + _im[b] * _im[b]);
             if (!_noiseInit) _noise[b] = mag;
             else _noise[b] = Math.Min(mag, _noise[b] * 1.0015f); // minimum statistics: instant fall, slow rise
 
-            float g = mag > _noise[b] * _sensitivity ? 1f : _floorGain;
+            float g = !enabled ? 1f : (mag > _noise[b] * sensitivity ? 1f : floorGain);
             g = _gain[b] * 0.6f + g * 0.4f; // time-smooth the mask
             _gain[b] = g;
 
@@ -218,5 +238,86 @@ public sealed class SpectralNoiseSuppressor : ISampleProvider
             }
         }
         if (inverse) for (int i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+    }
+}
+
+/// <summary>
+/// Pass-through tap that tracks a smoothed peak level (fast attack, slow release) and exposes it in dBFS.
+/// Used by the live mic monitor to show where the signal sits relative to the gate threshold. Audio is
+/// not modified. <see cref="LevelDb"/> is written on the audio thread and read on the UI thread (a single
+/// float — atomic; no lock needed for a meter).
+/// </summary>
+public sealed class LevelMeterSampleProvider : ISampleProvider
+{
+    private readonly ISampleProvider _src;
+    private readonly int _ch;
+    private readonly float _attack, _release;
+    private float _env; // linear envelope of the peak
+
+    public WaveFormat WaveFormat => _src.WaveFormat;
+
+    public LevelMeterSampleProvider(ISampleProvider src, float attackMs = 1f, float releaseMs = 300f)
+    {
+        _src = src;
+        _ch = src.WaveFormat.Channels;
+        int rate = src.WaveFormat.SampleRate;
+        _attack = (float)Math.Exp(-1.0 / Math.Max(1, rate * attackMs / 1000.0));
+        _release = (float)Math.Exp(-1.0 / Math.Max(1, rate * releaseMs / 1000.0));
+    }
+
+    /// <summary>Current smoothed peak level in dBFS (about -100 when silent).</summary>
+    public float LevelDb
+    {
+        get { float e = _env; return e <= 1e-7f ? -100f : (float)(20.0 * Math.Log10(e)); }
+    }
+
+    public int Read(float[] buffer, int offset, int count)
+    {
+        int n = _src.Read(buffer, offset, count);
+        for (int i = 0; i + _ch <= n; i += _ch)
+        {
+            float lvl = 0f;
+            for (int c = 0; c < _ch; c++) { float a = Math.Abs(buffer[offset + i + c]); if (a > lvl) lvl = a; }
+            float coef = lvl > _env ? _attack : _release; // instant rise, smooth fall
+            _env = lvl + (_env - lvl) * coef;
+        }
+        return n;
+    }
+}
+
+/// <summary>
+/// Averages all input channels down to a single mono channel. Handles any channel count (the built-in
+/// StereoToMono only handles 2), so the spectral suppressor's mono precondition holds for any mic.
+/// </summary>
+public sealed class DownmixToMonoSampleProvider : ISampleProvider
+{
+    private readonly ISampleProvider _src;
+    private readonly int _ch;
+    private readonly WaveFormat _fmt;
+    private float[] _buf = Array.Empty<float>();
+
+    public WaveFormat WaveFormat => _fmt;
+
+    public DownmixToMonoSampleProvider(ISampleProvider src)
+    {
+        _src = src;
+        _ch = src.WaveFormat.Channels;
+        _fmt = WaveFormat.CreateIeeeFloatWaveFormat(src.WaveFormat.SampleRate, 1);
+    }
+
+    public int Read(float[] buffer, int offset, int count)
+    {
+        int need = count * _ch;
+        if (_buf.Length < need) _buf = new float[need];
+        int got = _src.Read(_buf, 0, need);
+        int frames = got / _ch;
+        for (int f = 0; f < frames; f++)
+        {
+            float sum = 0f;
+            int baseIdx = f * _ch;
+            for (int c = 0; c < _ch; c++) sum += _buf[baseIdx + c];
+            buffer[offset + f] = sum / _ch;
+        }
+        return frames;
     }
 }

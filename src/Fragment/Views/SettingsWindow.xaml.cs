@@ -1,6 +1,9 @@
+using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Media;
+using System.Windows.Threading;
 using Fragment.ViewModels;
 
 namespace Fragment.Views;
@@ -13,6 +16,12 @@ public partial class SettingsWindow : Window
 {
     private readonly SettingsViewModel _viewModel;
 
+    // Drives the live mic-level meter while monitoring. Started/stopped with monitoring to avoid idle ticks.
+    private readonly DispatcherTimer _meterTimer;
+    private static readonly Brush OpenBrush = Freeze(Color.FromRgb(0x3D, 0xDC, 0x97));   // above gate (mic open)
+    private static readonly Brush ClosedBrush = Freeze(Color.FromRgb(0x33, 0x5A, 0x6E)); // below gate (gated out)
+    private const double MeterFloorDb = -70.0; // meter range bottom; top is 0 dBFS
+
     public SettingsWindow(SettingsViewModel viewModel)
     {
         InitializeComponent();
@@ -20,6 +29,37 @@ public partial class SettingsWindow : Window
         _viewModel = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
         DataContext = _viewModel;
         _viewModel.BrowseOutputFolder += OnBrowseOutputFolder;
+
+        _meterTimer = new DispatcherTimer(DispatcherPriority.Render) { Interval = TimeSpan.FromMilliseconds(33) };
+        _meterTimer.Tick += UpdateMeter;
+        _viewModel.MonitoringChanged += OnMonitoringChanged;
+    }
+
+    private static Brush Freeze(Color c) { var b = new SolidColorBrush(c); b.Freeze(); return b; }
+
+    private void OnMonitoringChanged()
+    {
+        if (_viewModel.IsMonitoring) { _meterTimer.Start(); }
+        else { _meterTimer.Stop(); MicMeterFill.Width = 0; }
+    }
+
+    // Map the post-suppression level (and the gate threshold) onto the meter bar; colour by gate state.
+    private void UpdateMeter(object? sender, EventArgs e)
+    {
+        double w = MicMeterTrack.ActualWidth - MicMeterTrack.BorderThickness.Left - MicMeterTrack.BorderThickness.Right;
+        if (w <= 0) return;
+
+        static double Norm(double db) => Math.Clamp((db - MeterFloorDb) / (0.0 - MeterFloorDb), 0.0, 1.0);
+
+        double level = _viewModel.MonitorLevelDb;
+        MicMeterFill.Width = Norm(level) * w;
+
+        int threshold = _viewModel.MicNoiseGateThresholdDb;
+        bool gateOn = _viewModel.MicNoiseGateEnabled;
+        MicMeterThreshold.Visibility = gateOn ? Visibility.Visible : Visibility.Collapsed;
+        if (gateOn) MicMeterThreshold.Margin = new Thickness(Norm(threshold) * w, 0, 0, 0);
+
+        MicMeterFill.Fill = (!gateOn || level >= threshold) ? OpenBrush : ClosedBrush;
     }
 
     private void OnBrowseOutputFolder()
@@ -46,6 +86,10 @@ public partial class SettingsWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        _meterTimer.Stop();
+        _meterTimer.Tick -= UpdateMeter;
+        _viewModel.MonitoringChanged -= OnMonitoringChanged;
+        _viewModel.StopMonitoring();
         _viewModel.BrowseOutputFolder -= OnBrowseOutputFolder;
         base.OnClosed(e);
     }

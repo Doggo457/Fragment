@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using System.Windows.Input;
 using Fragment.Models;
 using Fragment.Services;
+using Fragment.Services.Encoding;
 using Fragment.Utils;
 
 namespace Fragment.ViewModels;
@@ -52,6 +53,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
         BrowseOutputFolderCommand = new RelayCommand(_ => BrowseOutputFolder?.Invoke());
         RefreshDevicesCommand = new RelayCommand(async _ => await RefreshDevicesAsync());
         SaveCommand = new RelayCommand(_ => Save());
+        ToggleMonitorCommand = new RelayCommand(_ => ToggleMonitor());
 
         // Attempt to wire up the device enumerator if FFmpeg is available.
         var ffmpeg = FfmpegLocator.Find(_settings.FfmpegPath);
@@ -82,6 +84,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public ICommand BrowseOutputFolderCommand { get; }
     public ICommand RefreshDevicesCommand { get; }
     public ICommand SaveCommand { get; }
+    public ICommand ToggleMonitorCommand { get; }
 
     // ===================================================================
     // Capture tab
@@ -199,7 +202,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public AudioMode Audio
     {
         get => _profile.Audio;
-        set { if (_profile.Audio != value) { _profile.Audio = value; OnPropertyChanged(); OnPropertyChanged(nameof(UsesSystemAudio)); OnPropertyChanged(nameof(UsesMic)); OnPropertyChanged(nameof(EstimatedClipSize)); } }
+        set { if (_profile.Audio != value) { _profile.Audio = value; OnPropertyChanged(); OnPropertyChanged(nameof(UsesSystemAudio)); OnPropertyChanged(nameof(UsesMic)); OnPropertyChanged(nameof(EstimatedClipSize)); if (!UsesMic) StopMonitoring(); } }
     }
 
     public bool UsesSystemAudio => _profile.Audio is AudioMode.SystemOnly or AudioMode.SystemAndMic;
@@ -214,7 +217,7 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     public string? MicDevice
     {
         get => _profile.MicDevice;
-        set { if (_profile.MicDevice != value) { _profile.MicDevice = value; OnPropertyChanged(); } }
+        set { if (_profile.MicDevice != value) { _profile.MicDevice = value; OnPropertyChanged(); RestartMonitorIfActive(); } }
     }
 
     public int AudioBitrateKbps
@@ -224,28 +227,103 @@ public sealed class SettingsViewModel : INotifyPropertyChanged
     }
 
     // ---- Mic cleanup (GPU engine) ----
+    // Changes are pushed to the live monitor (if running) so the gate/suppression can be dialled in by ear.
     public bool MicNoiseGateEnabled
     {
         get => _profile.MicNoiseGateEnabled;
-        set { if (_profile.MicNoiseGateEnabled != value) { _profile.MicNoiseGateEnabled = value; OnPropertyChanged(); } }
+        set { if (_profile.MicNoiseGateEnabled != value) { _profile.MicNoiseGateEnabled = value; OnPropertyChanged(); if (_micMonitor != null) _micMonitor.GateEnabled = value; } }
     }
 
     public int MicNoiseGateThresholdDb
     {
         get => _profile.MicNoiseGateThresholdDb;
-        set { if (_profile.MicNoiseGateThresholdDb != value) { _profile.MicNoiseGateThresholdDb = value; OnPropertyChanged(); } }
+        set { if (_profile.MicNoiseGateThresholdDb != value) { _profile.MicNoiseGateThresholdDb = value; OnPropertyChanged(); if (_micMonitor != null) _micMonitor.GateThresholdDb = value; } }
     }
 
     public bool MicNoiseSuppressionEnabled
     {
         get => _profile.MicNoiseSuppressionEnabled;
-        set { if (_profile.MicNoiseSuppressionEnabled != value) { _profile.MicNoiseSuppressionEnabled = value; OnPropertyChanged(); } }
+        set { if (_profile.MicNoiseSuppressionEnabled != value) { _profile.MicNoiseSuppressionEnabled = value; OnPropertyChanged(); if (_micMonitor != null) _micMonitor.SuppressEnabled = value; } }
     }
 
     public int MicNoiseSuppressionStrength
     {
         get => _profile.MicNoiseSuppressionStrength;
-        set { if (_profile.MicNoiseSuppressionStrength != value) { _profile.MicNoiseSuppressionStrength = value; OnPropertyChanged(); } }
+        set { if (_profile.MicNoiseSuppressionStrength != value) { _profile.MicNoiseSuppressionStrength = value; OnPropertyChanged(); if (_micMonitor != null) _micMonitor.SuppressStrength = value; } }
+    }
+
+    // ---- Live mic monitor ("Listen") ----
+    private MicMonitor? _micMonitor;
+
+    /// <summary>True while the processed mic is being played back so the user can tune the cleanup by ear.</summary>
+    public bool IsMonitoring
+    {
+        get => _micMonitor != null;
+        private set { /* state lives on _micMonitor; this is here for binding notifications */ OnPropertyChanged(); OnPropertyChanged(nameof(MonitorButtonText)); MonitoringChanged?.Invoke(); }
+    }
+
+    public string MonitorButtonText => IsMonitoring ? "■  Stop listening" : "🎧  Listen";
+
+    private string? _monitorStatus;
+    public string? MonitorStatus
+    {
+        get => _monitorStatus;
+        private set { if (_monitorStatus != value) { _monitorStatus = value; OnPropertyChanged(); } }
+    }
+
+    /// <summary>Current post-suppression level in dBFS, polled by the view to drive the level meter (no notify).</summary>
+    public float MonitorLevelDb => _micMonitor?.LevelDb ?? -100f;
+
+    /// <summary>Raised on the UI thread whenever monitoring starts or stops (the view starts/stops its meter timer).</summary>
+    public event Action? MonitoringChanged;
+
+    private MicProcessing CurrentMicProcessing() => new(
+        MicNoiseGateEnabled, MicNoiseGateThresholdDb,
+        MicNoiseSuppressionEnabled, MicNoiseSuppressionStrength / 100f);
+
+    private void ToggleMonitor()
+    {
+        if (_micMonitor != null) { StopMonitoring(); return; }
+        MicMonitor? m = null;
+        try
+        {
+            m = new MicMonitor(MicDevice, CurrentMicProcessing());
+            if (!m.Start())
+            {
+                // Devices wouldn't start (e.g. unavailable / in exclusive use): don't enter the monitoring state.
+                try { m.Dispose(); } catch { }
+                MonitorStatus = "Couldn't start monitoring — the audio device is unavailable.";
+                IsMonitoring = false; // notify (timer stays stopped)
+                return;
+            }
+            _micMonitor = m;
+            MonitorStatus = "● Monitoring — speak into your mic. Use headphones to avoid echo/feedback.";
+            IsMonitoring = true; // notify
+        }
+        catch (Exception ex)
+        {
+            try { m?.Dispose(); } catch { }   // dispose the half-built local — the field is still null here
+            _micMonitor = null;
+            MonitorStatus = "Couldn't start monitoring: " + ex.Message;
+            IsMonitoring = false; // notify
+        }
+    }
+
+    /// <summary>Stops live monitoring and releases the audio devices. Safe to call when not monitoring.</summary>
+    public void StopMonitoring()
+    {
+        if (_micMonitor == null) return;
+        try { _micMonitor.Dispose(); } catch { }
+        _micMonitor = null;
+        MonitorStatus = null;
+        IsMonitoring = false; // notify
+    }
+
+    private void RestartMonitorIfActive()
+    {
+        if (_micMonitor == null) return;
+        StopMonitoring();
+        ToggleMonitor();
     }
 
     // ===================================================================

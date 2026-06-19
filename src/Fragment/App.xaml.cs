@@ -50,6 +50,13 @@ public partial class App : Application
                 _ => new MainWindow(),
             };
 
+            // Optionally select a tab (e.g. FRAGMENT_RENDER_TAB=2 for the Audio tab) so its content renders.
+            if (int.TryParse(Environment.GetEnvironmentVariable("FRAGMENT_RENDER_TAB"), out int tabIdx))
+            {
+                var tc = FindLogical<System.Windows.Controls.TabControl>(w.Content as System.Windows.DependencyObject);
+                if (tc != null && tabIdx >= 0 && tabIdx < tc.Items.Count) tc.SelectedIndex = tabIdx;
+            }
+
             double width = w.Width > 0 ? w.Width : 460;
             double height = w.Height > 0 ? w.Height : 560;
 
@@ -81,6 +88,18 @@ public partial class App : Application
         {
             try { System.IO.File.WriteAllText(outPath + ".err.txt", ex.ToString()); } catch { }
         }
+    }
+
+    // Depth-first search of the logical tree for the first element of type T (render harness helper).
+    private static T? FindLogical<T>(System.Windows.DependencyObject? root) where T : System.Windows.DependencyObject
+    {
+        if (root is null) return null;
+        if (root is T hit) return hit;
+        foreach (var child in System.Windows.LogicalTreeHelper.GetChildren(root))
+        {
+            if (child is System.Windows.DependencyObject d && FindLogical<T>(d) is { } found) return found;
+        }
+        return null;
     }
 
     private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
