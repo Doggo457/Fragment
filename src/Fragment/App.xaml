@@ -10,29 +10,57 @@
             <!--  Fragment — sleek modern dark theme                          -->
             <!-- ============================================================ -->
 
-            <Color x:Key="AccentColor">#FF00B3FF</Color>
-            <Color x:Key="AccentColorDark">#FF0090CC</Color>
-            <Color x:Key="WindowBackgroundColor">#FF14161A</Color>
-            <Color x:Key="PanelBackgroundColor">#FF1B1E24</Color>
-            <Color x:Key="ControlBackgroundColor">#FF23272E</Color>
-            <Color x:Key="ControlBackgroundHoverColor">#FF2C313A</Color>
-            <Color x:Key="BorderColor">#FF353A43</Color>
-            <Color x:Key="ForegroundColor">#FFEEF1F4</Color>
-            <Color x:Key="SubtleForegroundColor">#FF8A929C</Color>
-            <Color x:Key="DangerColor">#FFE5484D</Color>
+            <Color x:Key="AccentColor">#FF22B8FF</Color>
+            <Color x:Key="AccentColor2">#FF2C7BFF</Color>
+            <Color x:Key="AccentColorDark">#FF0E8FD6</Color>
+            <Color x:Key="WindowBackgroundColor">#FF0B0C10</Color>
+            <Color x:Key="PanelBackgroundColor">#FF14171F</Color>
+            <Color x:Key="ControlBackgroundColor">#FF1B1F29</Color>
+            <Color x:Key="ControlBackgroundHoverColor">#FF242A37</Color>
+            <Color x:Key="BorderColor">#FF272C38</Color>
+            <Color x:Key="BorderStrongColor">#FF3A4252</Color>
+            <Color x:Key="ForegroundColor">#FFEDF1F8</Color>
+            <Color x:Key="SubtleForegroundColor">#FF838C9C</Color>
+            <Color x:Key="DangerColor">#FFFF4D5E</Color>
 
             <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource AccentColor}" />
+            <SolidColorBrush x:Key="AccentBrush2" Color="{StaticResource AccentColor2}" />
             <SolidColorBrush x:Key="AccentBrushDark" Color="{StaticResource AccentColorDark}" />
             <SolidColorBrush x:Key="WindowBackgroundBrush" Color="{StaticResource WindowBackgroundColor}" />
             <SolidColorBrush x:Key="PanelBackgroundBrush" Color="{StaticResource PanelBackgroundColor}" />
             <SolidColorBrush x:Key="ControlBackgroundBrush" Color="{StaticResource ControlBackgroundColor}" />
             <SolidColorBrush x:Key="ControlBackgroundHoverBrush" Color="{StaticResource ControlBackgroundHoverColor}" />
             <SolidColorBrush x:Key="BorderBrush" Color="{StaticResource BorderColor}" />
+            <SolidColorBrush x:Key="BorderStrongBrush" Color="{StaticResource BorderStrongColor}" />
             <SolidColorBrush x:Key="ForegroundBrush" Color="{StaticResource ForegroundColor}" />
             <SolidColorBrush x:Key="SubtleForegroundBrush" Color="{StaticResource SubtleForegroundColor}" />
             <SolidColorBrush x:Key="DangerBrush" Color="{StaticResource DangerColor}" />
-            <!-- Aliases kept for compatibility with window-local references -->
             <SolidColorBrush x:Key="MutedForegroundBrush" Color="{StaticResource SubtleForegroundColor}" />
+
+            <!-- Accent gradient (cyan -> blue) for the hero control + primary buttons -->
+            <LinearGradientBrush x:Key="AccentGradient" StartPoint="0,0" EndPoint="1,1">
+                <GradientStop Color="{StaticResource AccentColor}" Offset="0" />
+                <GradientStop Color="{StaticResource AccentColor2}" Offset="1" />
+            </LinearGradientBrush>
+            <LinearGradientBrush x:Key="DangerGradient" StartPoint="0,0" EndPoint="1,1">
+                <GradientStop Color="#FFFF5C6B" Offset="0" />
+                <GradientStop Color="#FFE23241" Offset="1" />
+            </LinearGradientBrush>
+            <!-- App background: deep, with a faint top sheen for depth -->
+            <LinearGradientBrush x:Key="WindowBackgroundGradient" StartPoint="0.5,0" EndPoint="0.5,1">
+                <GradientStop Color="#FF111521" Offset="0" />
+                <GradientStop Color="{StaticResource WindowBackgroundColor}" Offset="0.55" />
+            </LinearGradientBrush>
+            <!-- Subtle elevation surface (card top sheen) -->
+            <LinearGradientBrush x:Key="CardGradient" StartPoint="0.5,0" EndPoint="0.5,1">
+                <GradientStop Color="#FF1A1E28" Offset="0" />
+                <GradientStop Color="{StaticResource PanelBackgroundColor}" Offset="1" />
+            </LinearGradientBrush>
+
+            <!-- Soft shadow for elevated surfaces -->
+            <DropShadowEffect x:Key="SoftShadow" BlurRadius="22" ShadowDepth="5" Direction="270" Color="#FF000000" Opacity="0.45" />
+            <DropShadowEffect x:Key="AccentGlow" BlurRadius="34" ShadowDepth="0" Color="{StaticResource AccentColor}" Opacity="0.55" />
+            <DropShadowEffect x:Key="DangerGlow" BlurRadius="34" ShadowDepth="0" Color="{StaticResource DangerColor}" Opacity="0.6" />
 
             <!-- Window / text -->
             <Style TargetType="{x:Type Window}">
@@ -92,10 +120,47 @@
             </Style>
 
             <Style x:Key="AccentButton" TargetType="{x:Type Button}" BasedOn="{StaticResource {x:Type Button}}">
-                <Setter Property="Background" Value="{StaticResource AccentBrush}" />
-                <Setter Property="Foreground" Value="#FF06121A" />
+                <Setter Property="Foreground" Value="#FF051019" />
                 <Setter Property="FontWeight" Value="SemiBold" />
-                <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}" />
+                <Setter Property="BorderThickness" Value="0" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="{x:Type Button}">
+                            <Border x:Name="border" Background="{StaticResource AccentGradient}" CornerRadius="9">
+                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" Margin="{TemplateBinding Padding}" />
+                            </Border>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="IsMouseOver" Value="True">
+                                    <Setter TargetName="border" Property="Effect" Value="{StaticResource AccentGlow}" />
+                                </Trigger>
+                                <Trigger Property="IsPressed" Value="True">
+                                    <Setter TargetName="border" Property="Opacity" Value="0.85" />
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter TargetName="border" Property="Opacity" Value="0.4" />
+                                    <Setter Property="Cursor" Value="Arrow" />
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <!-- Reusable elevated card -->
+            <Style x:Key="Card" TargetType="{x:Type Border}">
+                <Setter Property="Background" Value="{StaticResource CardGradient}" />
+                <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="12" />
+                <Setter Property="Padding" Value="16" />
+            </Style>
+
+            <!-- Small uppercase section label -->
+            <Style x:Key="SectionLabel" TargetType="{x:Type TextBlock}">
+                <Setter Property="Foreground" Value="{StaticResource SubtleForegroundBrush}" />
+                <Setter Property="FontSize" Value="10.5" />
+                <Setter Property="FontWeight" Value="SemiBold" />
+                <Setter Property="Margin" Value="0,0,0,6" />
             </Style>
 
             <!-- TextBox -->

@@ -3,151 +3,153 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
         mc:Ignorable="d"
         Title="Fragment"
         Icon="app.ico"
-        Width="460"
-        Height="560"
-        MinWidth="420"
-        MinHeight="520"
+        Width="466"
+        Height="586"
+        MinWidth="440"
+        MinHeight="548"
+        WindowStyle="None"
         WindowStartupLocation="CenterScreen"
-        Background="{DynamicResource WindowBackgroundBrush}"
+        Background="{DynamicResource WindowBackgroundGradient}"
         Foreground="{DynamicResource ForegroundBrush}"
         FontFamily="Segoe UI">
 
-    <Window.Resources>
-        <!-- Fallback brushes in case App.xaml resources are unavailable at design time. -->
-        <SolidColorBrush x:Key="WindowBackgroundBrush" Color="#FF1A1C20" />
-        <SolidColorBrush x:Key="PanelBackgroundBrush" Color="#FF24262C" />
-        <SolidColorBrush x:Key="ForegroundBrush" Color="#FFE8E8E8" />
-        <SolidColorBrush x:Key="MutedForegroundBrush" Color="#FF9AA0A6" />
-        <SolidColorBrush x:Key="AccentBrush" Color="#FF00B3FF" />
-        <SolidColorBrush x:Key="DangerBrush" Color="#FFE5484D" />
-        <SolidColorBrush x:Key="BorderBrush" Color="#FF34373E" />
+    <shell:WindowChrome.WindowChrome>
+        <shell:WindowChrome CaptionHeight="46" ResizeBorderThickness="6" CornerRadius="0" GlassFrameThickness="0,0,0,1" UseAeroCaptionButtons="False" />
+    </shell:WindowChrome.WindowChrome>
 
+    <Window.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVis" />
 
-        <!-- Flat dark button style. -->
-        <Style x:Key="FlatButton" TargetType="Button">
-            <Setter Property="Background" Value="{DynamicResource PanelBackgroundBrush}" />
-            <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}" />
-            <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
-            <Setter Property="BorderThickness" Value="1" />
-            <Setter Property="Padding" Value="12,8" />
+        <!-- Caption (window control) buttons -->
+        <Style x:Key="CaptionButton" TargetType="Button">
+            <Setter Property="Width" Value="40" />
+            <Setter Property="Height" Value="30" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Foreground" Value="{DynamicResource SubtleForegroundBrush}" />
             <Setter Property="Cursor" Value="Hand" />
-            <Setter Property="FontSize" Value="13" />
-            <Setter Property="SnapsToDevicePixels" Value="True" />
+            <Setter Property="shell:WindowChrome.IsHitTestVisibleInChrome" Value="True" />
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
-                        <Border x:Name="border"
-                                Background="{TemplateBinding Background}"
-                                BorderBrush="{TemplateBinding BorderBrush}"
-                                BorderThickness="{TemplateBinding BorderThickness}"
-                                CornerRadius="6">
-                            <ContentPresenter HorizontalAlignment="Center"
-                                              VerticalAlignment="Center"
-                                              Margin="{TemplateBinding Padding}" />
+                        <Border x:Name="b" Background="{TemplateBinding Background}" CornerRadius="7">
+                            <Path x:Name="g" Data="{TemplateBinding Tag}" Stroke="{TemplateBinding Foreground}" StrokeThickness="1.3"
+                                  HorizontalAlignment="Center" VerticalAlignment="Center" />
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="border" Property="Background" Value="#FF2E3138" />
-                                <Setter TargetName="border" Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
-                            </Trigger>
-                            <Trigger Property="IsPressed" Value="True">
-                                <Setter TargetName="border" Property="Background" Value="#FF3A3D45" />
-                            </Trigger>
-                            <Trigger Property="IsEnabled" Value="False">
-                                <Setter TargetName="border" Property="Opacity" Value="0.45" />
+                                <Setter TargetName="b" Property="Background" Value="{DynamicResource ControlBackgroundHoverBrush}" />
+                                <Setter TargetName="g" Property="Stroke" Value="{DynamicResource ForegroundBrush}" />
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>
         </Style>
+        <Style x:Key="CloseButton" TargetType="Button" BasedOn="{StaticResource CaptionButton}">
+            <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter Property="Foreground" Value="#FFFFFFFF" />
+                </Trigger>
+            </Style.Triggers>
+        </Style>
 
-        <!-- Large primary record button style. -->
-        <Style x:Key="RecordButton" TargetType="Button" BasedOn="{StaticResource FlatButton}">
-            <Setter Property="Background" Value="{DynamicResource AccentBrush}" />
-            <Setter Property="Foreground" Value="#FF0B1014" />
-            <Setter Property="BorderThickness" Value="0" />
-            <Setter Property="FontSize" Value="20" />
+        <!-- Hero record button: glowing gradient circle, red while recording -->
+        <Style x:Key="RecordButton" TargetType="Button">
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Foreground" Value="#FF06121A" />
+            <Setter Property="FontSize" Value="19" />
             <Setter Property="FontWeight" Value="SemiBold" />
-            <Setter Property="Height" Value="120" />
+            <Setter Property="Width" Value="130" />
+            <Setter Property="Height" Value="130" />
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
-                        <Border x:Name="border"
-                                Background="{TemplateBinding Background}"
-                                CornerRadius="60">
-                            <ContentPresenter HorizontalAlignment="Center"
-                                              VerticalAlignment="Center" />
-                        </Border>
+                        <Grid>
+                            <Ellipse x:Name="glow" Fill="{DynamicResource AccentGradient}" Effect="{DynamicResource AccentGlow}" />
+                            <Ellipse x:Name="face" Fill="{DynamicResource AccentGradient}" />
+                            <!-- glossy top highlight -->
+                            <Ellipse Margin="14,10,14,52" Opacity="0.22">
+                                <Ellipse.Fill>
+                                    <LinearGradientBrush StartPoint="0.5,0" EndPoint="0.5,1">
+                                        <GradientStop Color="#FFFFFFFF" Offset="0" />
+                                        <GradientStop Color="#00FFFFFF" Offset="1" />
+                                    </LinearGradientBrush>
+                                </Ellipse.Fill>
+                            </Ellipse>
+                            <Ellipse x:Name="ring" Margin="9" Stroke="#33FFFFFF" StrokeThickness="1.2" />
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Grid>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="border" Property="Opacity" Value="0.9" />
+                                <Setter TargetName="face" Property="Opacity" Value="0.94" />
                             </Trigger>
                             <Trigger Property="IsPressed" Value="True">
-                                <Setter TargetName="border" Property="Opacity" Value="0.78" />
+                                <Setter TargetName="face" Property="Opacity" Value="0.82" />
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>
-            <!-- Turn red while recording. -->
             <Style.Triggers>
                 <DataTrigger Binding="{Binding IsRecording}" Value="True">
-                    <Setter Property="Background" Value="{DynamicResource DangerBrush}" />
                     <Setter Property="Foreground" Value="#FFFFFFFF" />
                 </DataTrigger>
             </Style.Triggers>
         </Style>
 
-        <Style x:Key="SectionLabel" TargetType="TextBlock">
-            <Setter Property="Foreground" Value="{DynamicResource MutedForegroundBrush}" />
-            <Setter Property="FontSize" Value="11" />
-            <Setter Property="FontWeight" Value="SemiBold" />
-            <Setter Property="Margin" Value="2,0,0,4" />
+        <!-- Ghost/secondary action button (bottom row) -->
+        <Style x:Key="GhostButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="{DynamicResource ControlBackgroundBrush}" />
+            <Setter Property="Padding" Value="10,11" />
+            <Setter Property="FontSize" Value="12.5" />
         </Style>
-
     </Window.Resources>
 
-    <Grid Margin="20">
+    <Grid>
+      <Grid.RowDefinitions>
+          <RowDefinition Height="46" />
+          <RowDefinition Height="*" />
+      </Grid.RowDefinitions>
+
+      <!-- Title bar (drag area + window controls) -->
+      <Grid Grid.Row="0" Margin="16,0,8,0">
+          <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+              <Image Source="app.ico" Width="18" Height="18" RenderOptions.BitmapScalingMode="HighQuality" />
+              <TextBlock Text="Fragment" FontWeight="SemiBold" FontSize="13" Margin="9,0,0,0" VerticalAlignment="Center" />
+          </StackPanel>
+          <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+              <Button Style="{StaticResource CaptionButton}" Click="MinimizeClick" Tag="M0,6 L11,6" />
+              <Button Style="{StaticResource CloseButton}" Click="CloseClick" Tag="M0,0 L10,10 M10,0 L0,10" />
+          </StackPanel>
+      </Grid>
+
+      <Grid Grid.Row="1" Margin="22,4,22,18">
         <Grid.RowDefinitions>
-            <RowDefinition Height="Auto" />   <!-- Header -->
-            <RowDefinition Height="Auto" />   <!-- Record button -->
-            <RowDefinition Height="Auto" />   <!-- Status + timer -->
+            <RowDefinition Height="Auto" />   <!-- Header (unused) -->
+            <RowDefinition Height="Auto" />   <!-- Record hero -->
+            <RowDefinition Height="Auto" />   <!-- Status card -->
             <RowDefinition Height="Auto" />   <!-- Profile -->
             <RowDefinition Height="Auto" />   <!-- Replay + Save Clip -->
             <RowDefinition Height="*" />      <!-- Spacer -->
-            <RowDefinition Height="Auto" />   <!-- Action buttons -->
+            <RowDefinition Height="Auto" />   <!-- Update banner -->
+            <RowDefinition Height="Auto" />   <!-- Actions -->
         </Grid.RowDefinitions>
 
-        <!-- Header -->
-        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,18">
-            <Image Source="app.ico" Width="30" Height="30" VerticalAlignment="Center" RenderOptions.BitmapScalingMode="HighQuality" />
-            <TextBlock Text="Fragment"
-                       FontSize="22"
-                       FontWeight="Bold"
-                       Margin="10,0,0,0"
-                       VerticalAlignment="Center" />
-        </StackPanel>
+        <!-- Record hero -->
+        <Grid Grid.Row="1" Height="168">
+            <Ellipse Width="158" Height="158" Stroke="{DynamicResource BorderStrongBrush}" StrokeThickness="1" Opacity="0.5" />
+            <Button Style="{StaticResource RecordButton}"
+                    Command="{Binding StartStopCommand}"
+                    Content="{Binding RecordButtonText}"
+                    HorizontalAlignment="Center" VerticalAlignment="Center" />
+        </Grid>
 
-        <!-- Large Start/Stop record button -->
-        <Button Grid.Row="1"
-                Width="120"
-                Style="{StaticResource RecordButton}"
-                Command="{Binding StartStopCommand}"
-                Content="{Binding RecordButtonText}"
-                HorizontalAlignment="Center"
-                Margin="0,0,0,18" />
-
-        <!-- Live status + timer -->
-        <Border Grid.Row="2"
-                Background="{DynamicResource PanelBackgroundBrush}"
-                CornerRadius="8"
-                Padding="14,12"
-                Margin="0,0,0,16">
+        <!-- Status card -->
+        <Border Grid.Row="2" Style="{StaticResource Card}" Effect="{DynamicResource SoftShadow}" Margin="0,4,0,14">
             <Grid>
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*" />
@@ -155,107 +157,98 @@
                 </Grid.ColumnDefinitions>
                 <StackPanel Grid.Column="0" VerticalAlignment="Center">
                     <TextBlock Text="STATUS" Style="{StaticResource SectionLabel}" />
-                    <TextBlock Text="{Binding StatusText}"
-                               FontSize="15"
-                               TextTrimming="CharacterEllipsis" />
+                    <StackPanel Orientation="Horizontal">
+                        <Ellipse x:Name="StatusDot" Width="9" Height="9" Fill="{DynamicResource AccentBrush}" VerticalAlignment="Center">
+                            <Ellipse.Style>
+                                <Style TargetType="Ellipse">
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsRecording}" Value="True">
+                                            <Setter Property="Fill" Value="{DynamicResource DangerBrush}" />
+                                            <Setter Property="Effect" Value="{DynamicResource DangerGlow}" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Ellipse.Style>
+                        </Ellipse>
+                        <TextBlock Text="{Binding StatusText}" FontSize="14.5" Margin="9,0,0,0" TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
                 </StackPanel>
                 <StackPanel Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right">
                     <TextBlock Text="ELAPSED" Style="{StaticResource SectionLabel}" HorizontalAlignment="Right" />
-                    <TextBlock Text="{Binding RecordTimer}"
-                               FontSize="22"
-                               FontWeight="SemiBold"
-                               FontFamily="Consolas"
-                               Foreground="{DynamicResource AccentBrush}" />
+                    <TextBlock Text="{Binding RecordTimer}" FontSize="23" FontWeight="SemiBold"
+                               FontFamily="Consolas" Foreground="{DynamicResource AccentBrush}" />
                 </StackPanel>
             </Grid>
         </Border>
 
-        <!-- Profile selection -->
-        <StackPanel Grid.Row="3" Margin="0,0,0,16">
-            <TextBlock Text="PROFILE" Style="{StaticResource SectionLabel}" />
-            <ComboBox ItemsSource="{Binding ProfileNames}"
-                      SelectedItem="{Binding SelectedProfileName, Mode=TwoWay}" />
+        <!-- Profile -->
+        <StackPanel Grid.Row="3" Margin="0,0,0,14">
+            <TextBlock Text="PROFILE" Style="{StaticResource SectionLabel}" Margin="2,0,0,6" />
+            <ComboBox ItemsSource="{Binding ProfileNames}" SelectedItem="{Binding SelectedProfileName, Mode=TwoWay}" />
         </StackPanel>
 
         <!-- Replay toggle + Save Clip -->
-        <Grid Grid.Row="4" Margin="0,0,0,8">
+        <Grid Grid.Row="4">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="12" />
-                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
             </Grid.ColumnDefinitions>
 
-            <ToggleButton Grid.Column="0"
-                          Height="44"
-                          Cursor="Hand"
+            <ToggleButton Grid.Column="0" Height="48" Cursor="Hand"
                           IsChecked="{Binding IsReplayRunning, Mode=OneWay}"
                           Command="{Binding ToggleReplayCommand}"
                           Foreground="{DynamicResource ForegroundBrush}">
                 <ToggleButton.Template>
                     <ControlTemplate TargetType="ToggleButton">
-                        <Border x:Name="border"
-                                Background="{DynamicResource PanelBackgroundBrush}"
-                                BorderBrush="{DynamicResource BorderBrush}"
-                                BorderThickness="1"
-                                CornerRadius="6">
-                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        <Border x:Name="border" Background="{DynamicResource CardGradient}"
+                                BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="11" Padding="14,0">
+                            <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                                <Ellipse x:Name="dot" Width="9" Height="9" Fill="{DynamicResource SubtleForegroundBrush}" VerticalAlignment="Center" />
+                                <StackPanel Margin="11,0,0,0" VerticalAlignment="Center">
+                                    <TextBlock Text="Replay Buffer" FontWeight="SemiBold" FontSize="13.5" />
+                                    <TextBlock x:Name="sub" Text="{Binding ReplayStateText}" FontSize="11" Foreground="{DynamicResource SubtleForegroundBrush}" Margin="0,-1,0,0" />
+                                </StackPanel>
+                            </StackPanel>
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsChecked" Value="True">
-                                <Setter TargetName="border" Property="Background" Value="{DynamicResource AccentBrush}" />
-                                <Setter Property="Foreground" Value="#FF0B1014" />
+                                <Setter TargetName="border" Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
+                                <Setter TargetName="dot" Property="Fill" Value="{DynamicResource AccentBrush}" />
+                                <Setter TargetName="dot" Property="Effect" Value="{DynamicResource AccentGlow}" />
                             </Trigger>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="border" Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
+                                <Setter TargetName="border" Property="BorderBrush" Value="{DynamicResource BorderStrongBrush}" />
                             </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
                 </ToggleButton.Template>
-                <StackPanel Orientation="Horizontal">
-                    <TextBlock Text="Replay Buffer" FontWeight="SemiBold" />
-                    <TextBlock Text="{Binding ReplayStateText}" Margin="6,0,0,0" Opacity="0.8" />
-                </StackPanel>
             </ToggleButton>
 
-            <Button Grid.Column="2"
-                    Height="44"
-                    Style="{StaticResource FlatButton}"
-                    Command="{Binding SaveClipCommand}"
-                    Content="Save Clip" />
+            <Button Grid.Column="2" Height="48" MinWidth="116" Style="{StaticResource AccentButton}"
+                    Command="{Binding SaveClipCommand}" Content="Save Clip" />
         </Grid>
 
-        <!-- Update banner (shown only once a newer release has been downloaded) -->
-        <Button Grid.Row="5"
-                VerticalAlignment="Bottom"
-                Margin="0,0,0,12"
-                Style="{StaticResource FlatButton}"
-                BorderBrush="{DynamicResource AccentBrush}"
+        <!-- Update banner -->
+        <Button Grid.Row="6" VerticalAlignment="Bottom" Margin="0,0,0,12" Height="42"
+                Style="{StaticResource AccentButton}"
                 Command="{Binding ApplyUpdateCommand}"
                 Content="{Binding UpdateButtonText}"
                 Visibility="{Binding UpdateReady, Converter={StaticResource BoolToVis}}" />
 
-        <!-- Bottom action buttons -->
-        <Grid Grid.Row="6">
+        <!-- Bottom actions -->
+        <Grid Grid.Row="7">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="10" />
+                <ColumnDefinition Width="9" />
                 <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="10" />
+                <ColumnDefinition Width="9" />
                 <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>
-
-            <Button Grid.Column="0"
-                    Style="{StaticResource FlatButton}"
-                    Command="{Binding OpenSettingsCommand}"
-                    Content="Settings" />
-            <Button Grid.Column="2"
-                    Style="{StaticResource FlatButton}"
-                    Command="{Binding OpenEditorCommand}"
-                    Content="Editor" />
-            <Button Grid.Column="4"
-                    Style="{StaticResource FlatButton}"
-                    Command="{Binding OpenOutputFolderCommand}"
-                    Content="Output Folder" />
+            <Button Grid.Column="0" Style="{StaticResource GhostButton}" Command="{Binding OpenSettingsCommand}" Content="Settings" />
+            <Button Grid.Column="2" Style="{StaticResource GhostButton}" Command="{Binding OpenEditorCommand}" Content="Editor" />
+            <Button Grid.Column="4" Style="{StaticResource GhostButton}" Command="{Binding OpenOutputFolderCommand}" Content="Output Folder" />
         </Grid>
+      </Grid>
     </Grid>
 </Window>

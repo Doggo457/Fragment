@@ -16,6 +16,7 @@ public partial class SettingsWindow : Window
     public SettingsWindow(SettingsViewModel viewModel)
     {
         InitializeComponent();
+        Fragment.Services.NativeTheme.ApplyDarkTitleBar(this);
         _viewModel = viewModel ?? throw new ArgumentNullException(nameof(viewModel));
         DataContext = _viewModel;
         _viewModel.BrowseOutputFolder += OnBrowseOutputFolder;

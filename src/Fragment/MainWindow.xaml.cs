@@ -44,6 +44,9 @@ namespace Fragment
             catch { _tray = null; }
         }
 
+        private void MinimizeClick(object sender, RoutedEventArgs e) => WindowState = WindowState.Minimized;
+        private void CloseClick(object sender, RoutedEventArgs e) => Close();
+
         private void RestoreFromTray()
         {
             Show();

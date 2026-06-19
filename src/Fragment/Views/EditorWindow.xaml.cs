@@ -52,6 +52,7 @@ public partial class EditorWindow : Window
     public EditorWindow(VideoEditorService editor, string? initialInputPath = null)
     {
         InitializeComponent();
+        Fragment.Services.NativeTheme.ApplyDarkTitleBar(this);
         _editor = editor ?? throw new ArgumentNullException(nameof(editor));
 
         _tick = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
