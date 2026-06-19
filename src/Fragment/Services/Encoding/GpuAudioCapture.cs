@@ -120,14 +120,16 @@ public sealed class GpuAudioCapture : IDisposable
         while (_running)
         {
             Thread.Sleep(8);
+            var mixer = _mixer;            // snapshot: Dispose may null it concurrently
+            if (mixer is null || !_running) break;
             long target = sw.Elapsed.Ticks * Rate / TimeSpan.TicksPerSecond; // frames that should exist by now
             int need = (int)(target - produced);
             if (need <= 0) continue;
 
             int floats = need * Ch;
             if (_mixF.Length < floats) _mixF = new float[floats];
-            int got = _mixer!.Read(_mixF, 0, floats); // ReadFully → always returns 'floats'
-            if (got <= 0) continue;
+            int got = mixer.Read(_mixF, 0, floats); // ReadFully → always returns 'floats'
+            if (got <= 0 || !_running) continue;
 
             int outBytes = got * 2;
             if (_pcm.Length < outBytes) _pcm = new byte[outBytes];
@@ -146,7 +148,10 @@ public sealed class GpuAudioCapture : IDisposable
     public void Dispose()
     {
         _running = false;
-        try { _pump?.Join(500); } catch { }
+        // Join the pump BEFORE disposing the mixer/devices so it can't touch freed objects (it exits
+        // within one ~8 ms cycle once _running is false).
+        try { _pump?.Join(2000); } catch { }
+        _pump = null;
         try { _loopback?.StopRecording(); } catch { }
         try { _mic?.StopRecording(); } catch { }
         try { _loopback?.Dispose(); } catch { }

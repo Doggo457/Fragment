@@ -206,8 +206,7 @@ internal static class GpuSelfTest
         }
 
         double cpuMs = (proc.TotalProcessorTime - cpu0).TotalMilliseconds;
-        enc.Drain();
-        System.Threading.Thread.Sleep(200);
+        System.Threading.Thread.Sleep(300); // let in-flight encodes arrive (Dispose drains on scope exit)
 
         foreach (var f in firstFrames) W("  " + f);
         // keyframe interval stats

@@ -26,7 +26,6 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
     private const int AudioChannels = 2;
 
     private readonly object _ringLock = new();
-    private readonly object _saveLock = new();
     private readonly object _lifecycle = new();
     private readonly List<EncodedVideoSample> _videoRing = new();
     private readonly List<AudioPcmChunk> _audioRing = new();
@@ -51,6 +50,10 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
 
     private long _audioSamples, _audioAnchorNs;
     private bool _audioAnchored;
+
+    private long _videoBytes;                                  // running sum of encoded bytes in the ring
+    private const long MaxRingBytes = 2L * 1024 * 1024 * 1024; // safety cap so extreme settings can't OOM
+    private readonly SemaphoreSlim _saveGate = new(1, 1);      // one clip-save at a time
 
     public bool IsRunning => _running;
     public event EventHandler? Stopped;
@@ -103,9 +106,9 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
                 }
                 _wantAudio = audio != null;
 
-                _gpu = gpu; _cap = cap; _conv = conv; _enc = enc; _audio = audio; _videoOutType = enc.OutputType;
-                _audioAnchored = false; _audioSamples = 0;
-                lock (_ringLock) { _videoRing.Clear(); _audioRing.Clear(); }
+                _gpu = gpu; _cap = cap; _conv = conv; _enc = enc; _audio = audio;
+                _videoOutType = enc.CloneOutputType(); // own an independent copy; the encoder owns its own
+                lock (_ringLock) { _videoRing.Clear(); _audioRing.Clear(); _videoBytes = 0; _audioAnchored = false; _audioSamples = 0; }
 
                 try { timeBeginPeriod(1); _timerRaised = true; } catch { }
                 _running = true;
@@ -163,21 +166,28 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
         lock (_ringLock)
         {
             _videoRing.Add(s);
-            // GOP-granular eviction: keep the ring starting at the latest keyframe that is still >= bufferNs old,
-            // so it always begins on a keyframe and spans at least the buffer window.
-            long newest = s.TimeNs;
-            long horizon = newest - _bufferNs;
-            int cut = -1;
+            _videoBytes += s.Data.Length;
+
+            // Evict only when a keyframe arrives (eviction can only advance at GOP boundaries) — keeps the
+            // ring starting on a keyframe and bounds per-frame cost. Cut by time, then tighten for the byte cap.
+            if (!s.KeyFrame) return;
+            long horizon = s.TimeNs - _bufferNs;
+            int cut = 0;
             for (int i = 0; i < _videoRing.Count; i++)
                 if (_videoRing[i].KeyFrame && _videoRing[i].TimeNs <= horizon) cut = i;
-            if (cut > 0) _videoRing.RemoveRange(0, cut);
 
-            if (_audioRing.Count > 0)
+            if (_videoBytes > MaxRingBytes)
             {
-                long aHorizon = newest - _bufferNs - 10_000_000L;
-                int an = 0;
-                while (an < _audioRing.Count && _audioRing[an].TimeNs < aHorizon) an++;
-                if (an > 0) _audioRing.RemoveRange(0, an);
+                long bytesFromCut = 0;
+                for (int i = cut; i < _videoRing.Count; i++) bytesFromCut += _videoRing[i].Data.Length;
+                for (int i = cut + 1; i < _videoRing.Count && bytesFromCut > MaxRingBytes; i++)
+                    if (_videoRing[i].KeyFrame) { for (int j = cut; j < i; j++) bytesFromCut -= _videoRing[j].Data.Length; cut = i; }
+            }
+
+            if (cut > 0)
+            {
+                for (int i = 0; i < cut; i++) _videoBytes -= _videoRing[i].Data.Length;
+                _videoRing.RemoveRange(0, cut);
             }
         }
     }
@@ -189,19 +199,32 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
         int perChannel = count / (2 * AudioChannels);
         if (perChannel <= 0) return;
 
-        if (!_audioAnchored)
-        {
-            long bufDur = perChannel * 10_000_000L / AudioRate;
-            _audioAnchorNs = Math.Max(0, clock.Elapsed.Ticks - bufDur);
-            _audioSamples = 0;
-            _audioAnchored = true;
-        }
-        long ts = _audioAnchorNs + _audioSamples * 10_000_000L / AudioRate;
-        long dur = perChannel * 10_000_000L / AudioRate;
+        long elapsed = clock.Elapsed.Ticks;
         var copy = new byte[count];
         Buffer.BlockCopy(pcm, 0, copy, 0, count);
-        lock (_ringLock) { _audioRing.Add(new AudioPcmChunk { Pcm = copy, Count = count, TimeNs = ts, DurNs = dur }); }
-        _audioSamples += perChannel;
+
+        // All anchor/sample-count state + the ring are mutated under one lock so audio TimeNs stays
+        // monotonic and a session reset (Start) can't interleave with a late callback.
+        lock (_ringLock)
+        {
+            if (!_audioAnchored)
+            {
+                long bufDur = perChannel * 10_000_000L / AudioRate;
+                _audioAnchorNs = Math.Max(0, elapsed - bufDur);
+                _audioSamples = 0;
+                _audioAnchored = true;
+            }
+            long ts = _audioAnchorNs + _audioSamples * 10_000_000L / AudioRate;
+            long dur = perChannel * 10_000_000L / AudioRate;
+            _audioRing.Add(new AudioPcmChunk { Pcm = copy, Count = count, TimeNs = ts, DurNs = dur });
+            _audioSamples += perChannel;
+
+            // Self-bound by the audio clock so a video stall can't grow the audio ring without limit.
+            long aHorizon = ts - _bufferNs - 10_000_000L;
+            int an = 0;
+            while (an < _audioRing.Count && _audioRing[an].TimeNs < aHorizon) an++;
+            if (an > 0) _audioRing.RemoveRange(0, an);
+        }
     }
 
     public Task<string?> SaveClipAsync(int seconds, string outputPath)
@@ -209,41 +232,48 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
         if (string.IsNullOrWhiteSpace(outputPath)) throw new ArgumentException("Output path is required.", nameof(outputPath));
         if (seconds <= 0) seconds = 30;
 
-        EncodedVideoSample[] video;
-        AudioPcmChunk[] audio;
-        long newestNs, startVideoNs;
-        IMFMediaType? vType = _videoOutType;
+        // One save at a time. Also mutually exclusive with Stop()/teardown so the muxer can't use a
+        // disposed output type or ring. If a save is already running, ignore this request.
+        if (!_saveGate.Wait(0)) return Task.FromResult<string?>(null);
 
-        lock (_ringLock)
+        bool releaseNow = true;
+        try
         {
-            if (_videoRing.Count == 0 || vType is null) return Task.FromResult<string?>(null);
-            newestNs = _videoRing[^1].TimeNs;
-            long horizon = newestNs - seconds * 10_000_000L;
+            EncodedVideoSample[] video;
+            AudioPcmChunk[] audio;
+            long newestNs, startVideoNs;
+            IMFMediaType? vType = _videoOutType;
 
-            int startIdx = -1;
-            for (int i = 0; i < _videoRing.Count; i++)
-                if (_videoRing[i].KeyFrame && _videoRing[i].TimeNs <= horizon) startIdx = i;
-            if (startIdx < 0) // window not full yet: fall back to the first keyframe
-                for (int i = 0; i < _videoRing.Count; i++) if (_videoRing[i].KeyFrame) { startIdx = i; break; }
-            if (startIdx < 0) return Task.FromResult<string?>(null); // no keyframe yet
-
-            startVideoNs = _videoRing[startIdx].TimeNs;
-            video = _videoRing.GetRange(startIdx, _videoRing.Count - startIdx).ToArray();
-
-            var aud = new List<AudioPcmChunk>();
-            foreach (var c in _audioRing)
-                if (c.TimeNs + c.DurNs > startVideoNs && c.TimeNs <= newestNs) aud.Add(c);
-            audio = aud.ToArray();
-        }
-
-        return Task.Run(() =>
-        {
-            lock (_saveLock)
+            lock (_ringLock)
             {
-                MuxClip(outputPath, vType, video, audio, startVideoNs);
-                return (string?)outputPath;
+                if (_videoRing.Count == 0 || vType is null) return Task.FromResult<string?>(null);
+                newestNs = _videoRing[^1].TimeNs;
+                long horizon = newestNs - seconds * 10_000_000L;
+
+                int startIdx = -1;
+                for (int i = 0; i < _videoRing.Count; i++)
+                    if (_videoRing[i].KeyFrame && _videoRing[i].TimeNs <= horizon) startIdx = i;
+                if (startIdx < 0) // window not full yet: fall back to the first keyframe
+                    for (int i = 0; i < _videoRing.Count; i++) if (_videoRing[i].KeyFrame) { startIdx = i; break; }
+                if (startIdx < 0) return Task.FromResult<string?>(null); // no keyframe yet
+
+                startVideoNs = _videoRing[startIdx].TimeNs;
+                video = _videoRing.GetRange(startIdx, _videoRing.Count - startIdx).ToArray();
+
+                var aud = new List<AudioPcmChunk>();
+                foreach (var c in _audioRing)
+                    if (c.TimeNs + c.DurNs > startVideoNs && c.TimeNs <= newestNs) aud.Add(c);
+                audio = aud.ToArray();
             }
-        });
+
+            releaseNow = false; // the Task owns the gate now
+            return Task.Run(() =>
+            {
+                try { MuxClip(outputPath, vType!, video, audio, startVideoNs); return (string?)outputPath; }
+                finally { _saveGate.Release(); }
+            });
+        }
+        finally { if (releaseNow) _saveGate.Release(); }
     }
 
     private void MuxClip(string outputPath, IMFMediaType videoType, EncodedVideoSample[] video, AudioPcmChunk[] audio, long originNs)
@@ -319,7 +349,7 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
 
     private static void WriteBytes(IMFSinkWriter w, int stream, byte[] data, int count, long timeNs, long durNs, bool key)
     {
-        var buf = MediaFactory.MFCreateMemoryBuffer(count);
+        using var buf = MediaFactory.MFCreateMemoryBuffer(count); // disposed even if WriteSample throws
         buf.Lock(out IntPtr p, out _, out _);
         Marshal.Copy(data, 0, p, count);
         buf.Unlock();
@@ -331,7 +361,6 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
         sample.SampleDuration = durNs;
         if (key) sample.Set(SampleAttributeKeys.CleanPoint, 1u);
         w.WriteSample(stream, sample);
-        buf.Dispose();
     }
 
     public void Stop()
@@ -342,17 +371,20 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
             _running = false;
             try { _feeder?.Join(3000); } catch { }
             _feeder = null;
-            lock (_saveLock) { TearDown(); } // wait out any in-flight save before releasing the encoder/device
+            // Wait out any in-flight save (it holds _saveGate) before releasing the encoder/device.
+            _saveGate.Wait();
+            try { TearDown(); } finally { _saveGate.Release(); }
         }
     }
 
-    // Releases all session resources. Caller holds _lifecycle (and, for Stop, _saveLock).
+    // Releases all session resources. Caller holds _lifecycle and _saveGate.
     private void TearDown()
     {
         if (_timerRaised) { try { timeEndPeriod(1); } catch { } _timerRaised = false; }
+        // Stop+join the audio pump BEFORE clearing the ring so a late callback can't touch freed state.
         try { _audio?.Dispose(); } catch { }
-        try { _enc?.Drain(); } catch { }
-        try { _enc?.Dispose(); } catch { }
+        try { _enc?.Dispose(); } catch { } // Dispose does the ordered drain/flush internally
+        try { _videoOutType?.Dispose(); } catch { }
         if (_inputPool != null) foreach (var t in _inputPool) { try { t?.Dispose(); } catch { } }
         if (_nv12Pool != null) foreach (var t in _nv12Pool) { try { t?.Dispose(); } catch { } }
         try { _conv?.Dispose(); } catch { }

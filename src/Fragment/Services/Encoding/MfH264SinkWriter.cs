@@ -122,17 +122,15 @@ public sealed class MfH264SinkWriter : IDisposable
     /// <summary>Queues one NV12 frame (GPU texture, zero-copy) to the encoder. Times are in 100-ns units.</summary>
     public void WriteFrame(ID3D11Texture2D nv12, long sampleTime100ns, long duration100ns)
     {
-        var buffer = MediaFactory.MFCreateDXGISurfaceBuffer(ID3D11Texture2DIid, nv12, 0, false);
+        using var buffer = MediaFactory.MFCreateDXGISurfaceBuffer(ID3D11Texture2DIid, nv12, 0, false);
         try { using var b2d = buffer.QueryInterface<IMF2DBuffer>(); buffer.CurrentLength = b2d.ContiguousLength; }
         catch { /* some buffers report length already */ }
 
         using var sample = MediaFactory.MFCreateSample();
-        sample.AddBuffer(buffer);
+        sample.AddBuffer(buffer); // AddBuffer takes its own ref; the using releases ours even on throw
         sample.SampleTime = sampleTime100ns;
         sample.SampleDuration = duration100ns;
         lock (_writeGate) { if (!_finalized) _writer.WriteSample(_videoStream, sample); }
-
-        buffer.Dispose(); // the MFT keeps its own ref while encoding; our wrapper is done
     }
 
     /// <summary>Queues interleaved 16-bit PCM audio (system memory). Times are in 100-ns units.</summary>
@@ -140,7 +138,7 @@ public sealed class MfH264SinkWriter : IDisposable
     {
         if (_audioStream < 0 || count <= 0) return;
 
-        var buffer = MediaFactory.MFCreateMemoryBuffer(count);
+        using var buffer = MediaFactory.MFCreateMemoryBuffer(count);
         buffer.Lock(out IntPtr dst, out _, out _);
         Marshal.Copy(pcm, 0, dst, count);
         buffer.Unlock();
@@ -151,8 +149,6 @@ public sealed class MfH264SinkWriter : IDisposable
         sample.SampleTime = sampleTime100ns;
         sample.SampleDuration = duration100ns;
         lock (_writeGate) { if (!_finalized) _writer.WriteSample(_audioStream, sample); }
-
-        buffer.Dispose();
     }
 
     /// <summary>Flushes and finalizes the MP4 (writes the moov box). Safe to call once.</summary>

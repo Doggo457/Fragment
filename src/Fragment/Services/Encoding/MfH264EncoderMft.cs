@@ -13,10 +13,9 @@ namespace Fragment.Services.Encoding;
 /// the samples are handed to a callback (the replay ring). The MFT shares our D3D11 device via the DXGI
 /// device manager (zero-copy NV12 input).
 ///
-/// Threading contract: <see cref="TryConsumeNeedInput"/> + <see cref="SubmitFrame"/> are called ONLY on
-/// the single feeder thread (the only thread allowed to touch the D3D context). A private event thread
-/// pumps METransform* events and calls ProcessOutput (a CPU/bitstream pull — no D3D), delivering encoded
-/// samples via the output callback. This preserves the "all D3D on one thread" invariant.
+/// Threading: <see cref="TryConsumeNeedInput"/> + <see cref="SubmitFrame"/> are called on the single feeder
+/// thread (the only thread allowed to touch the D3D context). A private event thread pumps METransform*
+/// events and calls ProcessOutput. All IMFTransform calls are serialized by <c>_transformLock</c>.
 /// </summary>
 public sealed class MfH264EncoderMft : IDisposable
 {
@@ -30,21 +29,19 @@ public sealed class MfH264EncoderMft : IDisposable
     private static readonly Guid CODECAPI_AVEncMPVGOPSize = new("95f31b26-95a4-41aa-9303-246a7fc6eef1");
     private const uint eAVEncCommonRateControlMode_UnconstrainedVBR = 2;
 
-    // Expected control-flow HRESULTs not surfaced as named constants by Vortice.
     private const int MF_E_TRANSFORM_NEED_MORE_INPUT = unchecked((int)0xC00D6D72);
     private const int MF_E_TRANSFORM_STREAM_CHANGE = unchecked((int)0xC00D6D61);
 
     private readonly Action<EncodedVideoSample> _onOutput;
     private readonly IMFTransform _mft;
     private readonly IMFMediaEventGenerator _events;
+    private readonly object _transformLock = new();  // serializes all IMFTransform calls
+    private readonly object _typeLock = new();        // guards _outputType
+    private IMFMediaType _outputType;
     private Thread? _eventThread;
-    private volatile bool _running;
+    private volatile bool _disposed;
     private int _needInput;
     private readonly ManualResetEventSlim _drainDone = new(false);
-    private int _disposed;
-
-    /// <summary>The encoder's negotiated output media type (carries SPS/PPS) — reuse it for passthrough muxing.</summary>
-    public IMFMediaType OutputType { get; }
 
     public long SamplesOut; // diagnostics
     public long KeyFramesOut;
@@ -54,58 +51,62 @@ public sealed class MfH264EncoderMft : IDisposable
     {
         _onOutput = onOutput;
         _mft = CreateHardwareEncoder();
-
-        // Async MFTs must be unlocked before use.
-        _mft.Attributes.Set(TransformAttributeKeys.TransformAsyncUnlock, 1u);
-        // Low latency = no B-frames → encoded samples are in presentation order, simplest for the ring.
-        try { _mft.Attributes.Set(MF_LOW_LATENCY, 1u); } catch { }
         try
         {
-            _mft.Attributes.Set(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_UnconstrainedVBR);
-            _mft.Attributes.Set(CODECAPI_AVEncCommonMeanBitRate, (uint)bitrate);
-            _mft.Attributes.Set(CODECAPI_AVEncMPVGOPSize, (uint)(fps * 2));
+            _mft.Attributes.Set(TransformAttributeKeys.TransformAsyncUnlock, 1u);
+            try { _mft.Attributes.Set(MF_LOW_LATENCY, 1u); } catch { }
+            try
+            {
+                _mft.Attributes.Set(CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_UnconstrainedVBR);
+                _mft.Attributes.Set(CODECAPI_AVEncCommonMeanBitRate, (uint)bitrate);
+                _mft.Attributes.Set(CODECAPI_AVEncMPVGOPSize, (uint)(fps * 2));
+            }
+            catch { }
+
+            _mft.ProcessMessage(TMessageType.MessageSetD3DManager,
+                unchecked((UIntPtr)(ulong)gpu.DeviceManager.NativePointer.ToInt64()));
+
+            using (var outType = MediaFactory.MFCreateMediaType())
+            {
+                outType.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Video);
+                outType.Set(MediaTypeAttributeKeys.Subtype, VideoFormatGuids.H264);
+                outType.Set(MediaTypeAttributeKeys.AvgBitrate, (uint)bitrate);
+                outType.Set(MediaTypeAttributeKeys.InterlaceMode, MFVideoInterlace_Progressive);
+                outType.Set(MediaTypeAttributeKeys.Mpeg2Profile, eAVEncH264VProfile_Main);
+                SetRatio(outType, MediaTypeAttributeKeys.FrameSize, width, height);
+                SetRatio(outType, MediaTypeAttributeKeys.FrameRate, fps, 1);
+                SetRatio(outType, MediaTypeAttributeKeys.PixelAspectRatio, 1, 1);
+                _mft.SetOutputType(0, outType, 0);
+            }
+
+            using (var inType = MediaFactory.MFCreateMediaType())
+            {
+                inType.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Video);
+                inType.Set(MediaTypeAttributeKeys.Subtype, VideoFormatGuids.NV12);
+                inType.Set(MediaTypeAttributeKeys.InterlaceMode, MFVideoInterlace_Progressive);
+                SetRatio(inType, MediaTypeAttributeKeys.FrameSize, width, height);
+                SetRatio(inType, MediaTypeAttributeKeys.FrameRate, fps, 1);
+                SetRatio(inType, MediaTypeAttributeKeys.PixelAspectRatio, 1, 1);
+                _mft.SetInputType(0, inType, 0);
+            }
+
+            _outputType = _mft.GetOutputCurrentType(0);
+            _events = _mft.QueryInterface<IMFMediaEventGenerator>();
+
+            _mft.ProcessMessage(TMessageType.MessageNotifyBeginStreaming, UIntPtr.Zero);
+            _mft.ProcessMessage(TMessageType.MessageNotifyStartOfStream, UIntPtr.Zero);
+
+            _eventThread = new Thread(EventLoop) { IsBackground = true, Name = "MfH264EncoderEvents" };
+            _eventThread.Start();
         }
-        catch { }
-
-        // Share our D3D device so the encoder consumes NV12 textures zero-copy.
-        _mft.ProcessMessage(TMessageType.MessageSetD3DManager,
-            unchecked((UIntPtr)(ulong)gpu.DeviceManager.NativePointer.ToInt64()));
-
-        // Output type (H.264) MUST be set before the input type.
-        using (var outType = MediaFactory.MFCreateMediaType())
+        catch
         {
-            outType.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Video);
-            outType.Set(MediaTypeAttributeKeys.Subtype, VideoFormatGuids.H264);
-            outType.Set(MediaTypeAttributeKeys.AvgBitrate, (uint)bitrate);
-            outType.Set(MediaTypeAttributeKeys.InterlaceMode, MFVideoInterlace_Progressive);
-            outType.Set(MediaTypeAttributeKeys.Mpeg2Profile, eAVEncH264VProfile_Main);
-            SetRatio(outType, MediaTypeAttributeKeys.FrameSize, width, height);
-            SetRatio(outType, MediaTypeAttributeKeys.FrameRate, fps, 1);
-            SetRatio(outType, MediaTypeAttributeKeys.PixelAspectRatio, 1, 1);
-            _mft.SetOutputType(0, outType, 0);
+            // Don't leak the native HW encoder MFT (limited HW sessions) if init fails after activation.
+            try { _outputType?.Dispose(); } catch { }
+            try { _events?.Dispose(); } catch { }
+            try { _mft.Dispose(); } catch { }
+            throw;
         }
-
-        using (var inType = MediaFactory.MFCreateMediaType())
-        {
-            inType.Set(MediaTypeAttributeKeys.MajorType, MediaTypeGuids.Video);
-            inType.Set(MediaTypeAttributeKeys.Subtype, VideoFormatGuids.NV12);
-            inType.Set(MediaTypeAttributeKeys.InterlaceMode, MFVideoInterlace_Progressive);
-            SetRatio(inType, MediaTypeAttributeKeys.FrameSize, width, height);
-            SetRatio(inType, MediaTypeAttributeKeys.FrameRate, fps, 1);
-            SetRatio(inType, MediaTypeAttributeKeys.PixelAspectRatio, 1, 1);
-            _mft.SetInputType(0, inType, 0);
-        }
-
-        OutputType = _mft.GetOutputCurrentType(0); // negotiated type w/ SPS/PPS for the save muxer
-
-        _events = _mft.QueryInterface<IMFMediaEventGenerator>();
-
-        _mft.ProcessMessage(TMessageType.MessageNotifyBeginStreaming, UIntPtr.Zero);
-        _mft.ProcessMessage(TMessageType.MessageNotifyStartOfStream, UIntPtr.Zero);
-
-        _running = true;
-        _eventThread = new Thread(EventLoop) { IsBackground = true, Name = "MfH264EncoderEvents" };
-        _eventThread.Start();
     }
 
     private static IMFTransform CreateHardwareEncoder()
@@ -114,8 +115,7 @@ public sealed class MfH264EncoderMft : IDisposable
         var outInfo = new RegisterTypeInfo { GuidMajorType = MediaTypeGuids.Video, GuidSubtype = VideoFormatGuids.H264 };
         uint flags = (uint)(EnumFlag.EnumFlagHardware | EnumFlag.EnumFlagAsyncmft | EnumFlag.EnumFlagSortandfilter);
 
-        MediaFactory.MFTEnumEx(TransformCategoryGuids.VideoEncoder, flags, inInfo, outInfo,
-            out IntPtr pp, out uint count);
+        MediaFactory.MFTEnumEx(TransformCategoryGuids.VideoEncoder, flags, inInfo, outInfo, out IntPtr pp, out uint count);
         if (count == 0 || pp == IntPtr.Zero)
             throw new InvalidOperationException("No hardware H.264 encoder MFT found.");
 
@@ -141,7 +141,17 @@ public sealed class MfH264EncoderMft : IDisposable
     private static void SetRatio(IMFMediaType t, Guid key, int hi, int lo)
         => t.Set(key, ((ulong)(uint)hi << 32) | (uint)lo);
 
-    /// <summary>Feeder-thread: true if the encoder has asked for a frame (consume one NeedInput credit).</summary>
+    /// <summary>Returns an independent copy of the encoder's negotiated output type (SPS/PPS) for the save muxer.</summary>
+    public IMFMediaType CloneOutputType()
+    {
+        lock (_typeLock)
+        {
+            var c = MediaFactory.MFCreateMediaType();
+            _outputType.CopyAllItems(c);
+            return c;
+        }
+    }
+
     public bool TryConsumeNeedInput()
     {
         while (true)
@@ -155,44 +165,37 @@ public sealed class MfH264EncoderMft : IDisposable
     /// <summary>Feeder-thread only: hand one NV12 texture to the encoder. Call after TryConsumeNeedInput() is true.</summary>
     public void SubmitFrame(ID3D11Texture2D nv12, long sampleTime100ns, long duration100ns)
     {
-        var buffer = MediaFactory.MFCreateDXGISurfaceBuffer(ID3D11Texture2DIid, nv12, 0, false);
+        using var buffer = MediaFactory.MFCreateDXGISurfaceBuffer(ID3D11Texture2DIid, nv12, 0, false);
         try { using var b2d = buffer.QueryInterface<IMF2DBuffer>(); buffer.CurrentLength = b2d.ContiguousLength; }
         catch { }
 
         using var sample = MediaFactory.MFCreateSample();
-        sample.AddBuffer(buffer);
+        sample.AddBuffer(buffer); // AddBuffer takes its own ref; the using disposes our creation ref safely
         sample.SampleTime = sampleTime100ns;
         sample.SampleDuration = duration100ns;
-        _mft.ProcessInput(0, sample, 0);
-        buffer.Dispose();
+        lock (_transformLock) { if (!_disposed) _mft.ProcessInput(0, sample, 0); }
     }
 
     private void EventLoop()
     {
-        while (_running)
+        while (true)
         {
             IMFMediaEvent ev;
-            try { ev = _events.GetEvent(0); } // blocking
-            catch { break; }                  // generator shut down
+            try { ev = _events.GetEvent(0); } // blocking; unblocked by drain events or generator shutdown
+            catch { break; }
 
+            bool stop = false;
             try
             {
                 var type = ev.EventType;
-                if (type == MediaEventTypes.TransformNeedInput)
-                {
-                    Interlocked.Increment(ref _needInput);
-                }
-                else if (type == MediaEventTypes.TransformHaveOutput)
-                {
-                    DrainOutputs();
-                }
-                else if (type == MediaEventTypes.TransformDrainComplete)
-                {
-                    _drainDone.Set();
-                }
+                if (type == MediaEventTypes.TransformNeedInput) Interlocked.Increment(ref _needInput);
+                else if (type == MediaEventTypes.TransformHaveOutput) DrainOutputs();
+                else if (type == MediaEventTypes.TransformDrainComplete) { _drainDone.Set(); stop = true; }
             }
-            catch { /* keep pumping */ }
+            catch { }
             finally { try { ev.Dispose(); } catch { } }
+
+            if (stop) break; // drain completed -> shutdown
         }
     }
 
@@ -201,13 +204,23 @@ public sealed class MfH264EncoderMft : IDisposable
         while (true)
         {
             var buf = new OutputDataBuffer { StreamID = 0 };
-            Result hr = _mft.ProcessOutput(ProcessOutputFlags.None, 1, ref buf, out ProcessOutputStatus _);
+            Result hr;
+            lock (_transformLock) { hr = _mft.ProcessOutput(ProcessOutputFlags.None, 1, ref buf, out _); }
+            try { buf.Events?.Dispose(); } catch { }
 
             if (hr.Code == MF_E_TRANSFORM_NEED_MORE_INPUT) return;
             if (hr.Code == MF_E_TRANSFORM_STREAM_CHANGE)
             {
-                // Re-negotiate the output type and retry.
-                try { using var nt = _mft.GetOutputAvailableType(0, 0); _mft.SetOutputType(0, nt, 0); } catch { }
+                lock (_transformLock)
+                {
+                    try
+                    {
+                        using var nt = _mft.GetOutputAvailableType(0, 0);
+                        _mft.SetOutputType(0, nt, 0);
+                    }
+                    catch { }
+                    try { lock (_typeLock) { var old = _outputType; _outputType = _mft.GetOutputCurrentType(0); old?.Dispose(); } } catch { }
+                }
                 continue;
             }
             if (hr.Failure || buf.Sample is null) return;
@@ -222,42 +235,45 @@ public sealed class MfH264EncoderMft : IDisposable
                 mb.Unlock();
 
                 bool key = sample.GetUInt32(SampleAttributeKeys.CleanPoint, out uint v).Success && v != 0;
-                var enc = new EncodedVideoSample
-                {
-                    Data = data,
-                    TimeNs = sample.SampleTime,
-                    DurNs = sample.SampleDuration,
-                    KeyFrame = key,
-                };
                 SamplesOut++;
                 if (key) KeyFramesOut++;
-                _onOutput(enc);
+                if (!_disposed)
+                    _onOutput(new EncodedVideoSample { Data = data, TimeNs = sample.SampleTime, DurNs = sample.SampleDuration, KeyFrame = key });
             }
             finally { try { sample.Dispose(); } catch { } }
         }
     }
 
-    /// <summary>Flush in-flight frames: drain the encoder and wait until all pending outputs are emitted.</summary>
-    public void Drain(int timeoutMs = 3000)
+    public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
+
+        // Ordered async-MFT shutdown that also unblocks the event thread's blocking GetEvent:
+        // EndOfStream -> Drain (the MFT emits remaining outputs then DrainComplete, which wakes GetEvent and
+        // makes the event loop exit) -> join -> EndStreaming -> release.
         try
         {
             _drainDone.Reset();
-            _mft.ProcessMessage(TMessageType.MessageCommandDrain, UIntPtr.Zero);
-            _drainDone.Wait(timeoutMs);
+            lock (_transformLock)
+            {
+                try { _mft.ProcessMessage(TMessageType.MessageNotifyEndOfStream, UIntPtr.Zero); } catch { }
+                try { _mft.ProcessMessage(TMessageType.MessageCommandDrain, UIntPtr.Zero); } catch { }
+            }
+
+            if (_eventThread != null && !_eventThread.Join(3000))
+            {
+                // Device-loss / no DrainComplete: force the blocked GetEvent to return by tearing down the
+                // generator, then join again.
+                try { _events.Dispose(); } catch { }
+                try { _eventThread.Join(1000); } catch { }
+            }
         }
         catch { }
-    }
 
-    public void Dispose()
-    {
-        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        _running = false;
-        try { _mft.ProcessMessage(TMessageType.MessageNotifyEndOfStream, UIntPtr.Zero); } catch { }
-        try { _mft.ProcessMessage(TMessageType.MessageNotifyEndStreaming, UIntPtr.Zero); } catch { }
-        try { _eventThread?.Join(1000); } catch { }
+        try { lock (_transformLock) _mft.ProcessMessage(TMessageType.MessageNotifyEndStreaming, UIntPtr.Zero); } catch { }
         try { _events.Dispose(); } catch { }
-        try { OutputType?.Dispose(); } catch { }
+        try { lock (_typeLock) _outputType?.Dispose(); } catch { }
         try { _mft.Dispose(); } catch { }
         _drainDone.Dispose();
     }
