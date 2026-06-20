@@ -27,6 +27,7 @@ public sealed class MfH264EncoderMft : IDisposable
     private static readonly Guid CODECAPI_AVEncCommonRateControlMode = new("1c0608e9-370c-4710-8a58-cb6181c42423");
     private static readonly Guid CODECAPI_AVEncCommonMeanBitRate = new("f7222374-2144-4815-b550-a37f8e12ee52");
     private static readonly Guid CODECAPI_AVEncMPVGOPSize = new("95f31b26-95a4-41aa-9303-246a7fc6eef1");
+    private static readonly Guid CODECAPI_AVEncVideoForceKeyFrame = new("398c1b98-8353-475a-9ef2-8f265d260345");
     private const uint eAVEncCommonRateControlMode_UnconstrainedVBR = 2; // mean target; matches the proven sink-writer path
 
     private const int MF_E_TRANSFORM_NEED_MORE_INPUT = unchecked((int)0xC00D6D72);
@@ -186,6 +187,26 @@ public sealed class MfH264EncoderMft : IDisposable
             _outputType.CopyAllItems(c);
             return c;
         }
+    }
+
+    /// <summary>Ask the encoder to make the NEXT submitted frame a keyframe (IDR). Used by the replay feeder
+    /// when it drops to a low keepalive rate on a static screen, so keyframes keep arriving (a saved clip must
+    /// start on one) even though the count-based GOP would otherwise space them far apart. Best-effort; if the
+    /// encoder doesn't expose ICodecAPI the count-based GOP still applies. Feeder thread only.</summary>
+    public void RequestKeyFrame()
+    {
+        object? rcw = null;
+        try
+        {
+            rcw = Marshal.GetObjectForIUnknown(_mft.NativePointer);
+            if (rcw is ICodecAPI codec)
+            {
+                var api = CODECAPI_AVEncVideoForceKeyFrame; object v = (uint)1; // VARIANT VT_UI4
+                lock (_transformLock) { if (!_disposed) codec.SetValue(ref api, ref v); }
+            }
+        }
+        catch { }
+        finally { if (rcw != null) { try { Marshal.ReleaseComObject(rcw); } catch { } } }
     }
 
     public bool TryConsumeNeedInput()

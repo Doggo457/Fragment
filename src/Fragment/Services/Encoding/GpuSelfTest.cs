@@ -26,7 +26,9 @@ internal static class GpuSelfTest
 
         try
         {
-            if (mode == "8") RunIsolationLeakTrace(W);
+            if (mode == "10") RunWgcCadenceTest(W);
+            else if (mode == "9") RunVariablePtsTest(W);
+            else if (mode == "8") RunIsolationLeakTrace(W);
             else if (mode == "7") RunReplayLeakTrace(W);
             else if (mode == "6") RunMicDsp(W);
             else if (mode == "5") RunReplayBuffer(W);
@@ -273,9 +275,11 @@ internal static class GpuSelfTest
         int seconds = 240;
         if (int.TryParse(Environment.GetEnvironmentVariable("FRAGMENT_GPUTEST_SECONDS"), out int s) && s > 0) seconds = s;
 
+        int mon = int.TryParse(Environment.GetEnvironmentVariable("FRAGMENT_GPUTEST_MON"), out int mi) ? mi : -1;
         var profile = new Fragment.Models.RecordingProfile
         {
-            Source = Fragment.Models.CaptureSource.FullScreen,
+            Source = mon >= 0 ? Fragment.Models.CaptureSource.Monitor : Fragment.Models.CaptureSource.FullScreen,
+            MonitorIndex = Math.Max(0, mon),
             Container = Fragment.Models.OutputContainer.Mp4,
             Fps = 60,
             VideoBitrateKbps = 16000,
@@ -283,6 +287,7 @@ internal static class GpuSelfTest
             Audio = Fragment.Models.AudioMode.SystemOnly,
             CaptureCursor = true,
         };
+        W($"capture source: {(mon >= 0 ? $"monitor {mon}" : "primary/fullscreen")}");
 
         using var buf = new GpuReplayBuffer { Diag = _ => { } }; // suppress per-event diag noise
         var proc = System.Diagnostics.Process.GetCurrentProcess();
@@ -322,6 +327,126 @@ internal static class GpuSelfTest
 
         buf.Stop();
         W("RESULT: trace complete");
+    }
+
+    // Determines WGC's delivery cadence for STATIC content: does the frame pool hand us a fresh frame every
+    // refresh (so "a new frame arrived" != "the screen changed"), or only when pixels actually change? Polls at
+    // 60fps, reads back a sparse pixel sample of each delivered frame, and counts how many are byte-identical to
+    // the previous. High duplicates while arrived keeps climbing => encode-on-change must compare frames itself.
+    private static void RunWgcCadenceTest(Action<string> W)
+    {
+        int mon = int.TryParse(Environment.GetEnvironmentVariable("FRAGMENT_GPUTEST_MON"), out int mi) ? mi : 0;
+        int seconds = int.TryParse(Environment.GetEnvironmentVariable("FRAGMENT_GPUTEST_SECONDS"), out int s) && s > 0 ? s : 5;
+        using var gpu = new GpuRecordingDevice();
+        IntPtr hmon = WgcCapture.MonitorFromPoint(0, 0);
+        if (mon > 0) { var m = Fragment.Services.MonitorEnumerator.GetByIndex(mon); if (m != null) hmon = WgcCapture.MonitorFromPoint(m.X + 1, m.Y + 1); }
+        using var cap = new GpuWgcCapture(gpu, hmon, captureCursor: false); // cursor off: isolate CONTENT change
+        if (!cap.WaitForFirstFrame(5000, out int w, out int h)) { W("RESULT: FAIL - no frame"); return; }
+        W($"monitor {mon}: {w}x{h}, polling at 60fps for {seconds}s (cursor capture off)");
+
+        ID3D11Texture2D? staging = null;
+        long lastArrived = -1, prevHash = 0; int unique = 0, dup = 0, polls = 0;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        long freq = System.Diagnostics.Stopwatch.Frequency; long frame = 0;
+        while (clock.Elapsed.TotalSeconds < seconds)
+        {
+            long deadline = frame * freq / 60; long now = clock.ElapsedTicks;
+            if (deadline > now) { int ms = (int)((deadline - now) * 1000 / freq); if (ms > 0) System.Threading.Thread.Sleep(ms); }
+            frame++; polls++;
+
+            cap.PullLatest();
+            var src = cap.LatestTexture; if (src is null) continue;
+            long arrived = cap.ArrivedCount;
+            if (arrived == lastArrived) continue; // no new frame delivered this poll
+            lastArrived = arrived;
+
+            var d = src.Description;
+            if (staging is null)
+                staging = gpu.Device.CreateTexture2D(new Texture2DDescription
+                {
+                    Width = d.Width, Height = d.Height, MipLevels = 1, ArraySize = 1, Format = d.Format,
+                    SampleDescription = new SampleDescription(1, 0), Usage = ResourceUsage.Staging,
+                    BindFlags = BindFlags.None, CPUAccessFlags = CpuAccessFlags.Read, MiscFlags = ResourceOptionFlags.None,
+                });
+            gpu.Context.CopyResource(staging, src);
+            var map = gpu.Context.Map(staging, 0, MapMode.Read, Vortice.Direct3D11.MapFlags.None);
+            long hash = 1469598103934665603L; // FNV-ish over a sparse grid of pixels
+            unsafe
+            {
+                byte* basep = (byte*)map.DataPointer;
+                for (int y = 0; y < (int)d.Height; y += 37)
+                {
+                    uint* row = (uint*)(basep + (long)y * map.RowPitch);
+                    for (int x = 0; x < (int)d.Width; x += 53) { hash = (hash ^ row[x]) * 1099511628211L; }
+                }
+            }
+            gpu.Context.Unmap(staging, 0);
+            if (hash == prevHash) dup++; else unique++;
+            prevHash = hash;
+        }
+        try { staging?.Dispose(); } catch { }
+        W($"polls={polls} arrived={cap.ArrivedCount} delivered-frames-sampled={unique + dup} unique={unique} duplicate={dup}");
+        W($"delivery rate={cap.ArrivedCount / (double)seconds:F0}/s, of which ~{dup * 100.0 / Math.Max(1, unique + dup):F0}% were byte-identical to the previous");
+        W(dup > unique
+            ? "VERDICT: WGC delivers DUPLICATE frames for static content -> encode-on-change must diff frames itself"
+            : "VERDICT: most delivered frames differ -> screen was active (or WGC coalesces); inconclusive for idle unless duplicate% is high");
+        W("RESULT: PASS");
+    }
+
+    // Linchpin test for encode-on-change: submit frames at deliberately VARIABLE intervals (mimicking a static
+    // screen that drops to the keepalive rate) and confirm the hardware encoder PRESERVES the input PTS on its
+    // output (rather than re-timing to a constant frame rate). If the output PTS span tracks the input span, a
+    // variable-rate replay stream muxes to a clip with the correct total length; if not, encode-on-change is unsafe.
+    private static void RunVariablePtsTest(Action<string> W)
+    {
+        const int Fps = 60, Pool = 6;
+        using var gpu = new GpuRecordingDevice();
+        IntPtr hmon = WgcCapture.MonitorFromPoint(0, 0);
+        using var cap = new GpuWgcCapture(gpu, hmon, captureCursor: true);
+        if (!cap.WaitForFirstFrame(5000, out int w, out int h)) { W("RESULT: FAIL - no frame"); return; }
+        using var conv = new VideoProcessorConverter(gpu, w, h, Fps);
+        var nv12 = new ID3D11Texture2D[Pool];
+        for (int i = 0; i < Pool; i++) nv12[i] = conv.CreateNv12Texture();
+
+        var outTimes = new System.Collections.Generic.List<long>();
+        int outKeys = 0;
+        var gate = new object();
+        using (var enc = new MfH264EncoderMft(gpu, conv.Width, conv.Height, Fps, 16_000_000, s =>
+        {
+            lock (gate) { outTimes.Add(s.TimeNs); if (s.KeyFrame) outKeys++; }
+        }))
+        {
+            // Inter-frame gaps in ms: a few 60fps frames, then long static-keepalive gaps, then motion again.
+            long[] gapsMs = { 0, 16, 16, 1000, 1000, 1000, 16, 16, 16, 2000, 1000, 500 };
+            long tNs = 0; int submitted = 0;
+            for (int i = 0; i < gapsMs.Length; i++)
+            {
+                tNs += gapsMs[i] * 10_000L;                       // ms -> 100ns ticks
+                cap.PullLatest(); var src = cap.LatestTexture; if (src is null) continue;
+                int spin = 0; while (!enc.TryConsumeNeedInput() && spin++ < 1500) System.Threading.Thread.Sleep(2);
+                int slot = submitted % Pool;
+                conv.Convert(src, nv12[slot]); gpu.Context.Flush();
+                enc.RequestKeyFrame();                            // force a keyframe (as the static keepalive does)
+                enc.SubmitFrame(nv12[slot], tNs, 10_000_000L / Fps);
+                submitted++;
+                System.Threading.Thread.Sleep((int)Math.Max(1, gapsMs[i])); // pace in real time
+            }
+            System.Threading.Thread.Sleep(2000);                  // let in-flight encodes arrive
+            long inSpan = tNs;
+            lock (gate)
+            {
+                W($"submitted {submitted} frames; input PTS span={inSpan / 10000.0:F0}ms");
+                W($"got {outTimes.Count} outputs ({outKeys} keyframes)");
+                outTimes.Sort();
+                for (int i = 0; i < outTimes.Count; i++) W($"  out[{i,2}] t={outTimes[i] / 10000.0,7:F1}ms");
+                long outSpan = outTimes.Count > 1 ? outTimes[^1] - outTimes[0] : 0;
+                W($"output PTS span={outSpan / 10000.0:F0}ms (expected ~{inSpan / 10000.0:F0}ms)");
+                bool preserved = outTimes.Count >= submitted - 1 && inSpan > 0 && Math.Abs(outSpan - inSpan) < inSpan * 0.15;
+                W(preserved ? "RESULT: PASS - encoder preserves variable PTS (encode-on-change is safe)"
+                            : "RESULT: FAIL - encoder did NOT preserve variable PTS (encode-on-change would distort timing)");
+            }
+        }
+        foreach (var t in nv12) { try { t.Dispose(); } catch { } }
     }
 
     // Step 1+2 isolation: real capture -> NV12 -> hardware H.264 encoder MFT (direct), count samples/keyframes.

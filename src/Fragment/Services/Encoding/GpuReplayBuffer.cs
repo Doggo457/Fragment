@@ -458,10 +458,16 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
 
                 if (writeVideo)
                 {
-                    var e = video[vi++];
+                    var e = video[vi];
+                    // Derive display duration from the gap to the next frame's PTS. The feeder runs variable-rate
+                    // (it drops to a low keepalive rate on static screens), so the per-sample duration can't be
+                    // trusted to reflect actual spacing; the PTS timeline is the source of truth for total length.
+                    long nextNs = (vi + 1 < video.Length) ? video[vi + 1].TimeNs : e.TimeNs + e.DurNs;
+                    long vdur = Math.Max(1, nextNs - e.TimeNs);
+                    vi++;
                     if (vbuf.Length < e.Length) vbuf = new byte[e.Length];
                     vArena.ReadInto(e.Offset, e.Length, vbuf);
-                    WriteBytes(w, vIdx, vbuf, e.Length, Math.Max(0, e.TimeNs - originNs), e.DurNs, e.KeyFrame);
+                    WriteBytes(w, vIdx, vbuf, e.Length, Math.Max(0, e.TimeNs - originNs), vdur, e.KeyFrame);
                 }
                 else
                 {
