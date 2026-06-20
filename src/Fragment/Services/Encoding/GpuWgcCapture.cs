@@ -41,6 +41,11 @@ public sealed class GpuWgcCapture : IDisposable
 
     public long ArrivedCount => Interlocked.Read(ref _arrivedCount);
 
+    /// <summary>The app-owned BGRA copy of the most recent frame, on the GPU (null before the first frame).
+    /// Created with <see cref="BindFlags.RenderTarget"/>, so it can be used as a VideoProcessor input view
+    /// directly — letting the feeder convert straight from it with no intermediate copy. Feeder thread only.</summary>
+    public ID3D11Texture2D? LatestTexture => _hasFrame ? _latest : null;
+
     public GpuWgcCapture(GpuRecordingDevice gpu, IntPtr hmon, bool captureCursor)
     {
         _device = gpu.Device;
@@ -102,8 +107,10 @@ public sealed class GpuWgcCapture : IDisposable
         return true;
     }
 
-    /// <summary>Drains the pool to the newest queued frame and copies it into <see cref="_latest"/>.</summary>
-    private bool PullLatest()
+    /// <summary>Drains the pool to the newest queued frame and copies it into <see cref="_latest"/>.
+    /// Returns true only if a NEW frame arrived this call (the screen changed); false on a static screen.
+    /// Feeder thread only.</summary>
+    public bool PullLatest()
     {
         if (_disposed) return false;
         Direct3D11CaptureFrame? latest = null, f;

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
 
@@ -15,6 +16,14 @@ public sealed class VideoProcessorConverter : IDisposable
     private readonly ID3D11VideoContext _videoContext;
     private readonly ID3D11VideoProcessor _processor;
     private readonly ID3D11VideoProcessorEnumerator _enumerator;
+
+    // Processor views are bound to a specific texture and are expensive to build, so cache one per texture
+    // (keyed by its native COM pointer) instead of creating + destroying two COM objects on every frame.
+    // The set of textures is tiny and fixed (one capture surface in, a small NV12 pool out), so this caps at
+    // a handful of entries. Views hold a ref to their texture, so a cached entry keeps its texture alive.
+    private readonly Dictionary<IntPtr, ID3D11VideoProcessorInputView> _inputViews = new();
+    private readonly Dictionary<IntPtr, ID3D11VideoProcessorOutputView> _outputViews = new();
+    private readonly VideoProcessorStream[] _streams = new VideoProcessorStream[1]; // reused; no per-frame array alloc
 
     public int Width { get; }
     public int Height { get; }
@@ -93,32 +102,56 @@ public sealed class VideoProcessorConverter : IDisposable
     /// <summary>GPU BGRA→NV12 blit. Both textures live on the shared device; no CPU touches the pixels.</summary>
     public void Convert(ID3D11Texture2D bgraSource, ID3D11Texture2D nv12Dest)
     {
-        using var input = _videoDevice.CreateVideoProcessorInputView(bgraSource, _enumerator,
-            new VideoProcessorInputViewDescription
-            {
-                FourCC = 0,
-                ViewDimension = VideoProcessorInputViewDimension.Texture2D,
-                Texture2D = new Texture2DVideoProcessorInputView { MipSlice = 0, ArraySlice = 0 },
-            });
-        using var output = _videoDevice.CreateVideoProcessorOutputView(nv12Dest, _enumerator,
-            new VideoProcessorOutputViewDescription
-            {
-                ViewDimension = VideoProcessorOutputViewDimension.Texture2D,
-                Texture2D = new Texture2DVideoProcessorOutputView { MipSlice = 0 },
-            });
-
-        var stream = new VideoProcessorStream
+        var input = GetInputView(bgraSource);
+        var output = GetOutputView(nv12Dest);
+        _streams[0] = new VideoProcessorStream
         {
             Enable = true,
             OutputIndex = 0,
             InputFrameOrField = 0,
             InputSurface = input,
         };
-        _videoContext.VideoProcessorBlt(_processor, output, 0, 1, new[] { stream });
+        _videoContext.VideoProcessorBlt(_processor, output, 0, 1, _streams);
+    }
+
+    private ID3D11VideoProcessorInputView GetInputView(ID3D11Texture2D bgraSource)
+    {
+        IntPtr key = bgraSource.NativePointer;
+        if (!_inputViews.TryGetValue(key, out var v))
+        {
+            v = _videoDevice.CreateVideoProcessorInputView(bgraSource, _enumerator,
+                new VideoProcessorInputViewDescription
+                {
+                    FourCC = 0,
+                    ViewDimension = VideoProcessorInputViewDimension.Texture2D,
+                    Texture2D = new Texture2DVideoProcessorInputView { MipSlice = 0, ArraySlice = 0 },
+                });
+            _inputViews[key] = v;
+        }
+        return v;
+    }
+
+    private ID3D11VideoProcessorOutputView GetOutputView(ID3D11Texture2D nv12Dest)
+    {
+        IntPtr key = nv12Dest.NativePointer;
+        if (!_outputViews.TryGetValue(key, out var v))
+        {
+            v = _videoDevice.CreateVideoProcessorOutputView(nv12Dest, _enumerator,
+                new VideoProcessorOutputViewDescription
+                {
+                    ViewDimension = VideoProcessorOutputViewDimension.Texture2D,
+                    Texture2D = new Texture2DVideoProcessorOutputView { MipSlice = 0 },
+                });
+            _outputViews[key] = v;
+        }
+        return v;
     }
 
     public void Dispose()
     {
+        foreach (var v in _inputViews.Values) { try { v.Dispose(); } catch { } }
+        foreach (var v in _outputViews.Values) { try { v.Dispose(); } catch { } }
+        _inputViews.Clear(); _outputViews.Clear();
         try { _processor?.Dispose(); } catch { }
         try { _enumerator?.Dispose(); } catch { }
         try { _videoContext?.Dispose(); } catch { }

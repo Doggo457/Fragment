@@ -95,7 +95,10 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
     private MfH264EncoderMft? _enc;
     private GpuAudioCapture? _audio;
     private IMFMediaType? _videoOutType;
-    private ID3D11Texture2D[]? _inputPool, _nv12Pool;
+    // The Video Processor reads the capture's "latest" BGRA texture directly (no intermediate input copy),
+    // so we only keep the NV12 output pool. The pool lets the encoder read one slot asynchronously while the
+    // feeder writes the next — encoded output is not necessarily consumed by the time we produce the next frame.
+    private ID3D11Texture2D[]? _nv12Pool;
 
     private Thread? _feeder;
     private volatile bool _running;
@@ -160,9 +163,8 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
                 var conv = new VideoProcessorConverter(gpu, w, h, _fps);
                 var enc = new MfH264EncoderMft(gpu, conv.Width, conv.Height, _fps, videoBps, OnEncodedVideo);
 
-                _inputPool = new ID3D11Texture2D[PoolSize];
                 _nv12Pool = new ID3D11Texture2D[PoolSize];
-                for (int i = 0; i < PoolSize; i++) { _inputPool[i] = conv.CreateInputTexture(); _nv12Pool[i] = conv.CreateNv12Texture(); }
+                for (int i = 0; i < PoolSize; i++) _nv12Pool[i] = conv.CreateNv12Texture();
 
                 GpuAudioCapture? audio = null;
                 if (wantSystem || wantMic)
@@ -222,13 +224,18 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
 
                 // While a clip is being saved we pause capture so the muxer can stream the encoded bytes
                 // straight from the arena (no overwrite, no multi-hundred-MB copy). Brief buffering gap only.
-                int slot = (int)(frame % PoolSize);
-                if (!_saveInFlight && _cap!.CopyLatestInto(_inputPool![slot]))
+                if (!_saveInFlight)
                 {
-                    _conv!.Convert(_inputPool[slot], _nv12Pool![slot]);
-                    _gpu!.Context.Flush();
-                    if (_enc!.TryConsumeNeedInput())
-                        _enc.SubmitFrame(_nv12Pool[slot], _clock.Elapsed.Ticks, frameDur);
+                    _cap!.PullLatest();                       // refresh the latest frame (drains the WGC pool)
+                    var src = _cap.LatestTexture;
+                    if (src is not null)                      // null only before the very first frame
+                    {
+                        int slot = (int)(frame % PoolSize);
+                        _conv!.Convert(src, _nv12Pool![slot]); // convert straight from the capture texture (no copy)
+                        _gpu!.Context.Flush();
+                        if (_enc!.TryConsumeNeedInput())
+                            _enc.SubmitFrame(_nv12Pool[slot], _clock.Elapsed.Ticks, frameDur);
+                    }
                 }
                 frame++;
             }
@@ -517,13 +524,12 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
         try { _audio?.Dispose(); } catch { }
         try { _enc?.Dispose(); } catch { } // Dispose does the ordered drain/flush internally
         try { _videoOutType?.Dispose(); } catch { }
-        if (_inputPool != null) foreach (var t in _inputPool) { try { t?.Dispose(); } catch { } }
         if (_nv12Pool != null) foreach (var t in _nv12Pool) { try { t?.Dispose(); } catch { } }
         try { _conv?.Dispose(); } catch { }
         try { _cap?.Dispose(); } catch { }
         try { _gpu?.Dispose(); } catch { }
         _audio = null; _enc = null; _conv = null; _cap = null; _gpu = null;
-        _inputPool = null; _nv12Pool = null; _videoOutType = null; _clock = null;
+        _nv12Pool = null; _videoOutType = null; _clock = null;
         lock (_ringLock)
         {
             _videoRing.Clear(); _audioRing.Clear();
