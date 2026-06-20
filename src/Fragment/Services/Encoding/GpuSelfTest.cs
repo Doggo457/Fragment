@@ -26,7 +26,9 @@ internal static class GpuSelfTest
 
         try
         {
-            if (mode == "10") RunWgcCadenceTest(W);
+            if (mode == "12") RunAudioSaveSyncTest(W);
+            else if (mode == "11") RunAudioLagTest(W);
+            else if (mode == "10") RunWgcCadenceTest(W);
             else if (mode == "9") RunVariablePtsTest(W);
             else if (mode == "8") RunIsolationLeakTrace(W);
             else if (mode == "7") RunReplayLeakTrace(W);
@@ -327,6 +329,65 @@ internal static class GpuSelfTest
 
         buf.Stop();
         W("RESULT: trace complete");
+    }
+
+    // Regression test for the clip-save A/V desync: a clip save pauses capture (_saveInFlight) while the muxer
+    // streams the arena. The audio sample-clock MUST keep advancing during that pause, else audio falls behind
+    // the wall-clock-stamped video by the mux duration, accumulating across saves. Amplifies a save into a
+    // measurable 2s hold and checks the audio↔video skew is unchanged across it.
+    private static void RunAudioSaveSyncTest(Action<string> W)
+    {
+        var profile = new Fragment.Models.RecordingProfile
+        {
+            Source = Fragment.Models.CaptureSource.FullScreen,
+            Container = Fragment.Models.OutputContainer.Mp4,
+            Fps = 60, VideoBitrateKbps = 16000, AudioBitrateKbps = 160,
+            Audio = Fragment.Models.AudioMode.SystemOnly, CaptureCursor = true,
+        };
+        using var buf = new GpuReplayBuffer { Diag = _ => { } };
+        buf.Start(profile, bufferSeconds: 30);
+        System.Threading.Thread.Sleep(4000); // let the audio anchor + settle
+        double skew0 = (buf.DiagVideoClockNs - buf.DiagAudioClockNs) / 10000.0;
+        W($"before save-pause: video={buf.DiagVideoClockNs / 10000.0:F0}ms audio={buf.DiagAudioClockNs / 10000.0:F0}ms skew={skew0:F0}ms");
+        W("simulating a 2000ms clip-save pause (_saveInFlight held)...");
+        buf.DebugHoldSave(2000);
+        System.Threading.Thread.Sleep(600); // let audio resume for a few callbacks
+        double skew1 = (buf.DiagVideoClockNs - buf.DiagAudioClockNs) / 10000.0;
+        W($"after save-pause:  video={buf.DiagVideoClockNs / 10000.0:F0}ms audio={buf.DiagAudioClockNs / 10000.0:F0}ms skew={skew1:F0}ms");
+        double drift = skew1 - skew0;
+        W($"A/V skew change across the save: {drift:F0}ms  (FIXED: ~0; BUG froze audio: ~+2000ms)");
+        buf.Stop();
+        W(Math.Abs(drift) < 300 ? "RESULT: PASS - audio clock stayed aligned across the save" : "RESULT: FAIL - audio fell behind the video by ~the save duration");
+    }
+
+    // Measures the audio A/V-sync lag at its source: runs the real GpuAudioCapture (system + mic, matching the
+    // user's SystemAndMic config) and logs how much un-read audio sits in each source buffer over time. The pump
+    // drains at exactly real-time rate and never catches up, so any PERSISTENT buffer backlog (in ms) is frozen
+    // into the timeline as a fixed audio-lags-video offset. Content-independent, so it measures even with silence.
+    private static void RunAudioLagTest(Action<string> W)
+    {
+        var total = new long[1];
+        using var cap = new GpuAudioCapture(captureSystem: true, captureMic: true,
+            (_, n) => System.Threading.Interlocked.Add(ref total[0], n)) { Diag = W };
+        if (!cap.Active) { W("RESULT: FAIL - no audio source initialised"); return; }
+        W($"audio: sys+mic, {cap.SampleRate}Hz x{cap.Channels}");
+        int seconds = int.TryParse(Environment.GetEnvironmentVariable("FRAGMENT_GPUTEST_SECONDS"), out int s) && s > 0 ? s : 8;
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        cap.Start();
+        W("columns: t(ms) | sysBufferedMs micBufferedMs (un-read backlog == the A/V lag) | pcmDeliveredMs (should track t)");
+        double maxSys = 0, maxMic = 0;
+        while (sw.Elapsed.TotalSeconds < seconds)
+        {
+            System.Threading.Thread.Sleep(300);
+            long bytes = System.Threading.Interlocked.Read(ref total[0]);
+            double pcmMs = bytes / (double)(cap.SampleRate * cap.Channels * 2) * 1000.0;
+            double sb = cap.SysBufferedMs, mb = cap.MicBufferedMs;
+            if (sb > maxSys) maxSys = sb;
+            if (mb > maxMic) maxMic = mb;
+            W($"t={sw.ElapsedMilliseconds,5}  sysBuf={sb,7:F0}ms  micBuf={mb,7:F0}ms  pcmDelivered={pcmMs,7:F0}ms");
+        }
+        W($"SETTLED backlog (== fixed audio lag): sys≈{cap.SysBufferedMs:F0}ms mic≈{cap.MicBufferedMs:F0}ms (peak sys={maxSys:F0} mic={maxMic:F0})");
+        W("RESULT: PASS");
     }
 
     // Determines WGC's delivery cadence for STATIC content: does the frame pool hand us a fresh frame every

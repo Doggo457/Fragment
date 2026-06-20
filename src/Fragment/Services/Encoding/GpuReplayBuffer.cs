@@ -127,6 +127,11 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
     internal long DiagEncSamples => _enc?.SamplesOut ?? 0;
     internal long DiagEncKeyframes => _enc?.KeyFramesOut ?? 0;
     internal long DiagArrived => _cap?.ArrivedCount ?? 0;
+    // A/V-sync diagnostics: the audio timeline position vs the master (video) wall clock. These should stay
+    // within a few ms of each other even across a clip save; if audio falls behind, that's the desync.
+    internal long DiagAudioClockNs { get { lock (_ringLock) return _audioAnchored ? _audioAnchorNs + _audioSamples * 10_000_000L / AudioRate : 0; } }
+    internal long DiagVideoClockNs => _clock?.Elapsed.Ticks ?? 0;
+    internal void DebugHoldSave(int ms) { _saveInFlight = true; try { Thread.Sleep(ms); } finally { _saveInFlight = false; } }
 
     /// <summary>The GPU buffer handles MP4 full-screen / single-monitor capture (same as the GPU recorder).</summary>
     public static bool CanHandle(RecordingProfile p) =>
@@ -307,7 +312,7 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
         lock (_ringLock)
         {
             var arena = _audioArena;
-            if (arena is null || _saveInFlight || count > arena.Capacity) return; // paused while a save streams the arena
+            if (arena is null) return; // stopped / torn down
             if (!_audioAnchored)
             {
                 long bufDur = perChannel * 10_000_000L / AudioRate;
@@ -315,6 +320,12 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
                 _audioSamples = 0;
                 _audioAnchored = true;
             }
+            // While a clip is being saved we can't write the arena (the muxer is streaming it), but we MUST keep
+            // the audio sample clock advancing. If we froze it, the audio timeline would stall for the whole mux
+            // while video PTS keeps tracking the wall clock — shifting every later audio sample behind the video
+            // and ACCUMULATING into seconds of A/V desync across multiple saves. Advancing the count turns the
+            // dropped span into brief silence (matching the paused video) instead of a permanent offset.
+            if (_saveInFlight || count > arena.Capacity) { _audioSamples += perChannel; return; }
             long ts = _audioAnchorNs + _audioSamples * 10_000_000L / AudioRate;
             long dur = perChannel * 10_000_000L / AudioRate;
 

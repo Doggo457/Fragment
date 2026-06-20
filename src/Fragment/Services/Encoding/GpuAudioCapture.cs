@@ -39,6 +39,14 @@ public sealed class GpuAudioCapture : IDisposable
     public int SampleRate => Rate;
     public int Channels => Ch;
 
+    // Diagnostics (headless self-test): how much audio is sitting un-read in each source buffer. A persistent
+    // backlog here is a fixed A/V lag — the pump drains at real-time rate and never catches up. -1 = no source.
+    internal Action<string>? Diag;
+    internal double SysBufferedMs => _sysBuf?.BufferedDuration.TotalMilliseconds ?? -1;
+    internal double MicBufferedMs => _micBuf?.BufferedDuration.TotalMilliseconds ?? -1;
+    private Stopwatch? _diagSw;
+    private int _sysFirst, _micFirst;
+
     /// <summary>True if at least one source initialised — the recorder only adds an audio stream if so.</summary>
     public bool Active => _loopback != null || _mic != null;
 
@@ -57,7 +65,12 @@ public sealed class GpuAudioCapture : IDisposable
             {
                 _loopback = new WasapiLoopbackCapture();
                 _sysBuf = MakeBuffer(_loopback.WaveFormat);
-                _loopback.DataAvailable += (_, e) => _sysBuf!.AddSamples(e.Buffer, 0, e.BytesRecorded);
+                _loopback.DataAvailable += (_, e) =>
+                {
+                    if (Interlocked.Exchange(ref _sysFirst, 1) == 0)
+                        Diag?.Invoke($"sys first DataAvailable at {_diagSw?.ElapsedMilliseconds}ms, {e.BytesRecorded}B (~{e.BytesRecorded / (double)(_loopback!.WaveFormat.AverageBytesPerSecond) * 1000:F0}ms of audio)");
+                    _sysBuf!.AddSamples(e.Buffer, 0, e.BytesRecorded);
+                };
                 _mixer.AddMixerInput(Adapt(_sysBuf.ToSampleProvider(), _loopback.WaveFormat));
             }
             catch { _loopback = null; _sysBuf = null; }
@@ -71,7 +84,12 @@ public sealed class GpuAudioCapture : IDisposable
                 try { _mic = dev != null ? new WasapiCapture(dev) : new WasapiCapture(); }
                 catch { _mic = new WasapiCapture(); } // selected device unavailable -> default mic
                 _micBuf = MakeBuffer(_mic.WaveFormat);
-                _mic.DataAvailable += (_, e) => _micBuf!.AddSamples(e.Buffer, 0, e.BytesRecorded);
+                _mic.DataAvailable += (_, e) =>
+                {
+                    if (Interlocked.Exchange(ref _micFirst, 1) == 0)
+                        Diag?.Invoke($"mic first DataAvailable at {_diagSw?.ElapsedMilliseconds}ms, {e.BytesRecorded}B");
+                    _micBuf!.AddSamples(e.Buffer, 0, e.BytesRecorded);
+                };
 
                 // Mic cleanup chain: mono-ize -> spectral noise suppression -> noise gate -> 48k stereo.
                 ISampleProvider micSp = _micBuf.ToSampleProvider();
@@ -138,6 +156,7 @@ public sealed class GpuAudioCapture : IDisposable
             catch { /* best effort */ }
         }
 
+        _diagSw = Stopwatch.StartNew();
         try { _loopback?.StartRecording(); } catch { }
         try { _mic?.StartRecording(); } catch { }
 
