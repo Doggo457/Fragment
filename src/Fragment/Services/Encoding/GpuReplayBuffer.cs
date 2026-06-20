@@ -496,8 +496,15 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
             _running = false;
             try { _feeder?.Join(3000); } catch { }
             _feeder = null;
-            // Wait out any in-flight save (it holds _saveGate) before releasing the encoder/device.
-            _saveGate.Wait();
+            // Wait out any in-flight save (it holds _saveGate) before tearing down the encoder/device/arena.
+            // Bounded so a stuck muxer (severe disk/MF fault) can't deadlock shutdown forever; on timeout we
+            // abandon teardown rather than free native memory the stuck mux is still reading (it would crash).
+            // The leaked session is reclaimed on process exit. 30 s comfortably covers any real clip mux.
+            if (!_saveGate.Wait(30000))
+            {
+                try { Diag?.Invoke("Stop: clip save still running after 30s; abandoning teardown."); } catch { }
+                return;
+            }
             try { TearDown(); } finally { _saveGate.Release(); }
         }
     }
