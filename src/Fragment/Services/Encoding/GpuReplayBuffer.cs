@@ -70,15 +70,15 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
             System.Runtime.InteropServices.Marshal.Copy(src, srcOff, (IntPtr)(_buf + p), first);
             if (first < len) System.Runtime.InteropServices.Marshal.Copy(src, srcOff + first, (IntPtr)_buf, len - first);
         }
-        public byte[] Read(long pos, int len)
+        // Read len bytes at pos into dest[0..len) (dest must be >= len). Lets the muxer reuse one buffer
+        // instead of allocating a managed array per frame (which, for a multi-minute clip, spiked the heap).
+        public void ReadInto(long pos, int len, byte[] dest)
         {
-            var d = new byte[len];
-            if (_buf == null) return d; // defensive: never touch freed memory (callers also hold _ringLock)
+            if (_buf == null) return;
             int p = (int)(pos % _cap);
             int first = Math.Min(len, (int)(_cap - p));
-            System.Runtime.InteropServices.Marshal.Copy((IntPtr)(_buf + p), d, 0, first);
-            if (first < len) System.Runtime.InteropServices.Marshal.Copy((IntPtr)_buf, d, first, len - first);
-            return d;
+            System.Runtime.InteropServices.Marshal.Copy((IntPtr)(_buf + p), dest, 0, first);
+            if (first < len) System.Runtime.InteropServices.Marshal.Copy((IntPtr)_buf, dest, first, len - first);
         }
         public void Dispose()
         {
@@ -99,6 +99,7 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
 
     private Thread? _feeder;
     private volatile bool _running;
+    private volatile bool _saveInFlight; // while true, the feeder pauses writing so a save can stream the arena
     private bool _timerRaised;
     private int _fps, _audioBitrate;
     private long _bufferNs;
@@ -219,8 +220,10 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
                 long now = _clock.ElapsedTicks;
                 if (deadline > now) { int ms = (int)((deadline - now) * 1000 / freq); if (ms > 0) Thread.Sleep(ms); }
 
+                // While a clip is being saved we pause capture so the muxer can stream the encoded bytes
+                // straight from the arena (no overwrite, no multi-hundred-MB copy). Brief buffering gap only.
                 int slot = (int)(frame % PoolSize);
-                if (_cap!.CopyLatestInto(_inputPool![slot]))
+                if (!_saveInFlight && _cap!.CopyLatestInto(_inputPool![slot]))
                 {
                     _conv!.Convert(_inputPool[slot], _nv12Pool![slot]);
                     _gpu!.Context.Flush();
@@ -246,7 +249,7 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
         lock (_ringLock)
         {
             var arena = _videoArena;
-            if (arena is null) return;          // stopped / not started
+            if (arena is null || _saveInFlight) return; // stopped, or paused while a save streams the arena
             int len = s.Length;
             if (len <= 0 || len > arena.Capacity) return; // skip a frame larger than the whole arena (pathological)
 
@@ -297,7 +300,7 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
         lock (_ringLock)
         {
             var arena = _audioArena;
-            if (arena is null || count > arena.Capacity) return;
+            if (arena is null || _saveInFlight || count > arena.Capacity) return; // paused while a save streams the arena
             if (!_audioAnchored)
             {
                 long bufDur = perChannel * 10_000_000L / AudioRate;
@@ -339,10 +342,11 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
         bool releaseNow = true;
         try
         {
-            EncodedVideoSample[] video;
-            AudioPcmChunk[] audio;
+            VideoEntry[] vEntries;
+            AudioEntry[] aEntries;
             long newestNs, startVideoNs;
             IMFMediaType? vType = _videoOutType;
+            ByteArena? vArena, aArena;
 
             lock (_ringLock)
             {
@@ -358,41 +362,39 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
                 if (startIdx < 0) return Task.FromResult<string?>(null); // no keyframe yet
 
                 startVideoNs = _videoRing[startIdx].TimeNs;
-                var vArena = _videoArena; var aArena = _audioArena;
+                vArena = _videoArena; aArena = _audioArena;
                 if (vArena is null) return Task.FromResult<string?>(null);
 
-                // Copy the clip OUT of the circular arena into owned arrays, so the background mux is
-                // independent of the live ring (which keeps overwriting the arena as new frames arrive).
-                video = new EncodedVideoSample[_videoRing.Count - startIdx];
-                for (int i = startIdx; i < _videoRing.Count; i++)
-                {
-                    var e = _videoRing[i];
-                    video[i - startIdx] = new EncodedVideoSample { Data = vArena.Read(e.Offset, e.Length), Length = e.Length, TimeNs = e.TimeNs, DurNs = e.DurNs, KeyFrame = e.KeyFrame };
-                }
+                // Snapshot only the lightweight METADATA (offsets/lengths — a few hundred KB), NOT the encoded
+                // bytes. The muxer streams the bytes straight from the arena; we set _saveInFlight so the feeder
+                // pauses and can't overwrite them. This avoids copying the whole (multi-minute) clip into managed
+                // memory, which spiked + retained hundreds of MB.
+                vEntries = new VideoEntry[_videoRing.Count - startIdx];
+                _videoRing.CopyTo(startIdx, vEntries, 0, vEntries.Length);
 
-                var aud = new List<AudioPcmChunk>();
-                if (aArena != null)
-                    foreach (var c in _audioRing)
-                        if (c.TimeNs + c.DurNs > startVideoNs && c.TimeNs <= newestNs)
-                            aud.Add(new AudioPcmChunk { Pcm = aArena.Read(c.Offset, c.Count), Count = c.Count, TimeNs = c.TimeNs, DurNs = c.DurNs });
-                audio = aud.ToArray();
+                var aud = new List<AudioEntry>();
+                foreach (var c in _audioRing)
+                    if (c.TimeNs + c.DurNs > startVideoNs && c.TimeNs <= newestNs) aud.Add(c);
+                aEntries = aud.ToArray();
+
+                _saveInFlight = true; // pause capture for the duration of the mux (cleared in the Task's finally)
             }
 
-            releaseNow = false; // the Task owns the gate now
+            releaseNow = false; // the Task owns the gate + the _saveInFlight flag now
             try
             {
                 return Task.Run(() =>
                 {
-                    try { MuxClip(outputPath, vType!, video, audio, startVideoNs); return (string?)outputPath; }
-                    finally { _saveGate.Release(); }
+                    try { MuxClip(outputPath, vType!, vArena, vEntries, aArena, aEntries, startVideoNs); return (string?)outputPath; }
+                    finally { _saveInFlight = false; _saveGate.Release(); }
                 });
             }
-            catch { _saveGate.Release(); throw; } // scheduling failure: don't leak the gate
+            catch { _saveInFlight = false; _saveGate.Release(); throw; } // scheduling failure: don't leak the gate/flag
         }
         finally { if (releaseNow) _saveGate.Release(); }
     }
 
-    private void MuxClip(string outputPath, IMFMediaType videoType, EncodedVideoSample[] video, AudioPcmChunk[] audio, long originNs)
+    private void MuxClip(string outputPath, IMFMediaType videoType, ByteArena vArena, VideoEntry[] video, ByteArena? aArena, AudioEntry[] audio, long originNs)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputPath))!);
 
@@ -435,7 +437,10 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
             Diag?.Invoke("  mux: writing (interleaved by timestamp)...");
 
             // Interleave video + audio in timestamp order so neither stream races ahead and back-pressures
-            // the muxer (writing all of one stream first deadlocks WriteSample on stream sync).
+            // the muxer (writing all of one stream first deadlocks WriteSample on stream sync). Each frame is
+            // streamed from the arena into a single reused buffer per stream — no per-frame allocation, so a
+            // long clip doesn't spike the heap. Capture is paused (_saveInFlight), so the arena is stable.
+            byte[] vbuf = Array.Empty<byte>(), abuf = Array.Empty<byte>();
             int vi = 0, ai = 0;
             while (vi < video.Length || (aIdx >= 0 && ai < audio.Length))
             {
@@ -446,13 +451,17 @@ public sealed class GpuReplayBuffer : IReplayBuffer, IDisposable
 
                 if (writeVideo)
                 {
-                    var s = video[vi++];
-                    WriteBytes(w, vIdx, s.Data, s.Length, Math.Max(0, s.TimeNs - originNs), s.DurNs, s.KeyFrame);
+                    var e = video[vi++];
+                    if (vbuf.Length < e.Length) vbuf = new byte[e.Length];
+                    vArena.ReadInto(e.Offset, e.Length, vbuf);
+                    WriteBytes(w, vIdx, vbuf, e.Length, Math.Max(0, e.TimeNs - originNs), e.DurNs, e.KeyFrame);
                 }
                 else
                 {
                     var c = audio[ai++];
-                    WriteBytes(w, aIdx, c.Pcm, c.Count, Math.Max(0, c.TimeNs - originNs), c.DurNs, false);
+                    if (abuf.Length < c.Count) abuf = new byte[c.Count];
+                    aArena!.ReadInto(c.Offset, c.Count, abuf);
+                    WriteBytes(w, aIdx, abuf, c.Count, Math.Max(0, c.TimeNs - originNs), c.DurNs, false);
                 }
             }
 

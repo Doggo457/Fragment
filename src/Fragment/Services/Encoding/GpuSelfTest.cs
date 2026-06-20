@@ -291,10 +291,21 @@ internal static class GpuSelfTest
         buf.Start(profile, bufferSeconds: windowSec);
 
         bool forceGc = Environment.GetEnvironmentVariable("FRAGMENT_GPUTEST_FORCEGC") == "1";
+        int saveAt = int.TryParse(Environment.GetEnvironmentVariable("FRAGMENT_GPUTEST_SAVEAT"), out int sa) ? sa : 0;
+        bool saved = false;
         var sw = System.Diagnostics.Stopwatch.StartNew();
         while (sw.Elapsed.TotalSeconds < seconds && buf.IsRunning)
         {
             System.Threading.Thread.Sleep(5000);
+            if (saveAt > 0 && !saved && sw.Elapsed.TotalSeconds >= saveAt)
+            {
+                saved = true;
+                W($"--- SAVE START at t={sw.Elapsed.TotalSeconds:F0}s ---");
+                string clip = System.IO.Path.Combine(Dir, "leaktrace_clip.mp4");
+                try { System.IO.File.Delete(clip); } catch { }
+                _ = buf.SaveClipAsync(windowSec - 5, clip).ContinueWith(t =>
+                    W($"--- SAVE DONE: {(t.Result ?? "null")} ({(System.IO.File.Exists(clip) ? new System.IO.FileInfo(clip).Length : 0)} bytes) ---"));
+            }
             if (forceGc) // measure the TRUE reclaimable floor: blocking compacting gen2 + LOH compaction
             {
                 System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
