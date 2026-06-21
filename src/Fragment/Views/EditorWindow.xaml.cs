@@ -514,6 +514,12 @@ public partial class EditorWindow : Window
             o.OutHeight = outH;
             o.OutWidth = (int)Math.Round(outH * aspect);
         }
+
+        // Manual rotation (fallback if a clip comes out the wrong way). 90/270 also swaps the canvas so the
+        // rotated frame fills it without bars.
+        o.RotateDegrees = RotateBox.SelectedIndex switch { 1 => 90, 2 => 180, 3 => 270, _ => 0 };
+        if (o.RotateDegrees is 90 or 270)
+            (o.OutWidth, o.OutHeight) = (o.OutHeight, o.OutWidth);
         return o;
     }
 

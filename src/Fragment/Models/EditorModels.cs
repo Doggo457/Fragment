@@ -53,6 +53,10 @@ public sealed class ExportOptions
     public int OutWidth { get; set; } = 1920;
     public int OutHeight { get; set; } = 1080;
 
+    /// <summary>Manual rotation applied on export, on top of the source's own (auto-applied) orientation:
+    /// 0 = none, 90 = clockwise, 180, 270 = counter-clockwise. The UI swaps OutWidth/OutHeight for 90/270.</summary>
+    public int RotateDegrees { get; set; }
+
     public int OutFps { get; set; } = 60;
 
     /// <summary>When set, the encoder targets this file size (we compute the bitrate from total duration).

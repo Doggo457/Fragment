@@ -139,6 +139,17 @@
                         </ComboBox>
                     </StackPanel>
 
+                    <StackPanel Orientation="Horizontal" Margin="0,4,18,4">
+                        <TextBlock Style="{StaticResource LabelText}" Text="Rotate"/>
+                        <ComboBox x:Name="RotateBox" Width="110" SelectedIndex="0"
+                                  ToolTip="Manually rotate the export (in case a clip comes out the wrong way).">
+                            <ComboBoxItem Content="None"/>
+                            <ComboBoxItem Content="90° right"/>
+                            <ComboBoxItem Content="180°"/>
+                            <ComboBoxItem Content="90° left"/>
+                        </ComboBox>
+                    </StackPanel>
+
                     <StackPanel x:Name="SizePanel" Orientation="Horizontal" Margin="0,4,18,4">
                         <TextBlock Style="{StaticResource LabelText}" Text="Target size"/>
                         <ComboBox x:Name="SizeBox" Width="150" SelectedIndex="0">

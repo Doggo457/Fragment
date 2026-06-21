@@ -4,7 +4,6 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Fragment.Models;
@@ -37,37 +36,36 @@ public sealed class VideoEditorService
     public (int Width, int Height)? ProbeDisplaySize(string file)
     {
         if (string.IsNullOrWhiteSpace(file) || !File.Exists(file)) return null;
+        // Decode ONE frame through ffmpeg's simple path, which APPLIES the rotation metadata regardless of how
+        // it's encoded (Display Matrix, legacy rotate tag, etc.). The decoded frame's size IS the true display
+        // size — far more robust than parsing rotation strings ourselves (which missed some phone formats).
+        string tmp = Path.Combine(Path.GetTempPath(), "Fragment", "probe_" + Guid.NewGuid().ToString("N") + ".png");
         try
         {
-            var psi = new ProcessStartInfo(_ffmpegPath, "-hide_banner -i " + Quote(file))
+            Directory.CreateDirectory(Path.GetDirectoryName(tmp)!);
+            var psi = new ProcessStartInfo(_ffmpegPath,
+                "-hide_banner -loglevel error -y -i " + Quote(file) + " -frames:v 1 " + Quote(tmp))
             {
                 RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true,
             };
-            using var p = Process.Start(psi);
-            if (p is null) return null;
-            string err = p.StandardError.ReadToEnd();
-            p.WaitForExit(5000);
-
-            string? vline = null;
-            foreach (var line in err.Split('\n'))
-                if (line.Contains("Video:")) { vline = line; break; }
-            if (vline is null) return null;
-
-            var dm = Regex.Match(vline, @"\b(\d{2,5})x(\d{2,5})\b"); // the WxH on the video stream line
-            if (!dm.Success) return null;
-            int w = int.Parse(dm.Groups[1].Value), h = int.Parse(dm.Groups[2].Value);
-
-            // Display Matrix "rotation of ±90/270 degrees" → ffmpeg auto-rotates, so the displayed frame is
-            // the coded size with W/H swapped. (180° keeps the dimensions.)
-            var rm = Regex.Match(err, @"rotation of (-?\d+(?:\.\d+)?) degrees");
-            if (rm.Success)
+            using (var p = Process.Start(psi))
             {
-                int rot = ((int)Math.Round(Math.Abs(double.Parse(rm.Groups[1].Value, CultureInfo.InvariantCulture)))) % 180;
-                if (rot == 90) (w, h) = (h, w);
+                if (p is null) return null;
+                p.StandardError.ReadToEnd();
+                if (!p.WaitForExit(8000)) { try { p.Kill(true); } catch { } return null; }
             }
-            return (w, h);
+            if (!File.Exists(tmp)) return null;
+
+            // PNG header: 8-byte signature + chunk-length(4) + "IHDR"(4) + width(4 BE) + height(4 BE).
+            var hdr = new byte[24];
+            using (var fs = File.OpenRead(tmp))
+                if (fs.Read(hdr, 0, 24) < 24) return null;
+            int w = (hdr[16] << 24) | (hdr[17] << 16) | (hdr[18] << 8) | hdr[19];
+            int h = (hdr[20] << 24) | (hdr[21] << 16) | (hdr[22] << 8) | hdr[23];
+            return (w > 0 && h > 0) ? (w, h) : null;
         }
         catch { return null; }
+        finally { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }
     }
 
     // ------------------------------------------------------------------ thumbnails
@@ -274,6 +272,8 @@ public sealed class VideoEditorService
     {
         int w = EnsureEven(Math.Max(2, o.OutWidth));
         int h = EnsureEven(Math.Max(2, o.OutHeight));
+        // Optional manual rotation, applied per segment before the scale/pad to the (already-swapped) canvas.
+        string rot = o.RotateDegrees switch { 90 => "transpose=1,", 180 => "transpose=1,transpose=1,", 270 => "transpose=2,", _ => "" };
         bool gif = o.Format == EditorOutputFormat.Gif;
         bool wantAudio = !gif && o.AudioMode != EditorAudioMode.Mute;
 
@@ -294,7 +294,7 @@ public sealed class VideoEditorService
             // Video: trim → reset PTS → fit the canvas (preserve aspect, pad with black) → square pixels → common fps.
             filter.Append('[').Append(i).Append(":v]")
                   .Append("trim=start=").Append(inS).Append(":end=").Append(outS).Append(',')
-                  .Append("setpts=PTS-STARTPTS,")
+                  .Append("setpts=PTS-STARTPTS,").Append(rot)
                   .Append("scale=").Append(w).Append(':').Append(h).Append(":force_original_aspect_ratio=decrease,")
                   .Append("pad=").Append(w).Append(':').Append(h).Append(":(ow-iw)/2:(oh-ih)/2,")
                   .Append("setsar=1,fps=").Append(o.OutFps.ToString(inv))
