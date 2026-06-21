@@ -26,7 +26,8 @@ internal static class GpuSelfTest
 
         try
         {
-            if (mode == "14") RunWindowReplay(W);
+            if (mode == "16") RunFollowFallbackTest(W);
+            else if (mode == "14") RunWindowReplay(W);
             else if (mode == "13") RunWindowCapture(W);
             else if (mode == "12") RunAudioSaveSyncTest(W);
             else if (mode == "11") RunAudioLagTest(W);
@@ -331,6 +332,27 @@ internal static class GpuSelfTest
 
         buf.Stop();
         W("RESULT: trace complete");
+    }
+
+    // Active-window FALLBACK: when there is no followable window (desktop focused / last window closed),
+    // capture must fall back to full screen, not stop. Proven by constructing a follow-active capture with a
+    // deliberately bogus initial handle (the "no window" worst case): the OLD code threw; the new code resolves
+    // its own target (window or monitor) and starts. Also checks the IsFollowable predicate that drives it.
+    private static void RunFollowFallbackTest(Action<string> W)
+    {
+        uint self = (uint)Environment.ProcessId;
+        IntPtr fg = WindowEnumerator.Foreground();
+        W($"IsFollowable(foreground \"{WindowEnumerator.TitleOf(fg)}\") = {WindowEnumerator.IsFollowable(fg, self)}");
+        W($"IsFollowable(IntPtr.Zero / no window) = {WindowEnumerator.IsFollowable(IntPtr.Zero, self)} (False => falls back to full screen)");
+
+        using var gpu = new GpuRecordingDevice();
+        using var cap = new GpuWgcCapture(gpu, IntPtr.Zero, captureCursor: true, isWindow: false, followActive: true);
+        bool ok = cap.WaitForFirstFrame(3000, out int w, out int h);
+        W($"follow-active capture built with a BOGUS initial handle -> firstFrame={ok} {w}x{h}");
+        // Pull a few more frames to exercise the per-frame retarget path without throwing.
+        for (int i = 0; i < 10; i++) { cap.PullLatest(); System.Threading.Thread.Sleep(20); }
+        W($"after 10 pulls: arrived={cap.ArrivedCount}, latest={cap.LatestWidth}x{cap.LatestHeight}");
+        W(ok ? "RESULT: PASS - follow-active starts + survives with no valid initial window (falls back, never stops)" : "RESULT: FAIL");
     }
 
     // End-to-end: the replay buffer capturing the ACTIVE WINDOW (follow-active), scaling into the fixed canvas,

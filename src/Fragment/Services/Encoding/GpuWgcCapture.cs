@@ -35,10 +35,11 @@ public sealed class GpuWgcCapture : IDisposable
     private ID3D11Texture2D? _latest; // app-owned BGRA copy of the most recent frame (on the GPU)
     private int _w, _h;
     private bool _hasFrame;
-    private readonly bool _isWindow;            // window capture re-sizes; monitor capture never does
     private readonly bool _followActive;        // re-target whichever window is focused, as focus changes
     private readonly bool _captureCursor;
-    private IntPtr _curHwnd;                     // window currently being captured (follow-active)
+    private IntPtr _curHwnd;                     // window HWND or monitor HMONITOR currently captured
+    private bool _curIsWindowTarget;            // is the live session a window (resizes) vs the monitor fallback?
+    private IntPtr _fallbackMonitor;            // primary monitor — captured full-screen when there's no window to follow
     private readonly uint _selfPid;             // skip our own windows when following focus
     private Windows.Graphics.SizeInt32 _poolSize; // current frame-pool size (tracked so we Recreate on window resize)
     private const int PoolBuffers = 3;
@@ -60,61 +61,85 @@ public sealed class GpuWgcCapture : IDisposable
 
     /// <param name="handle">A monitor HMONITOR (isWindow=false) or a window HWND (isWindow=true).</param>
     /// <param name="followActive">Re-target the foreground window as the user switches windows (implies window capture).</param>
+    /// <param name="handle">A monitor HMONITOR (isWindow=false) or a window HWND (isWindow=true). Ignored when followActive.</param>
+    /// <param name="followActive">Re-target the foreground window as the user switches windows; falls back to full screen when none.</param>
     public GpuWgcCapture(GpuRecordingDevice gpu, IntPtr handle, bool captureCursor, bool isWindow = false, bool followActive = false)
     {
         _device = gpu.Device;
         _context = gpu.Context;
         _winrtDevice = gpu.WinRtDevice;
-        _isWindow = isWindow || followActive;
         _followActive = followActive;
         _captureCursor = captureCursor;
         _selfPid = (uint)Environment.ProcessId;
-        _curHwnd = handle;
-        BuildSession(handle, _isWindow);
+        _fallbackMonitor = WgcCapture.MonitorFromPoint(0, 0); // primary monitor = the follow-active full-screen fallback
+
+        if (followActive)
+        {
+            var (h, isWin) = ResolveFollowTarget();
+            if (!TryBuild(h, isWin) && !TryBuild(_fallbackMonitor, false))
+                throw new InvalidOperationException("GpuWgcCapture: could not start follow-active capture.");
+        }
+        else if (!TryBuild(handle, isWindow))
+        {
+            throw new InvalidOperationException("GpuWgcCapture: could not start capture.");
+        }
     }
 
-    // Creates the WGC item + frame pool + session for a monitor or window. Called by the ctor and, for
-    // follow-active capture, again on each foreground change (the previous one is disposed first).
-    private void BuildSession(IntPtr handle, bool isWindow)
+    // Builds a WGC session for a monitor or window and ATOMICALLY swaps it in: on ANY failure the previous
+    // session is left running, so a bad retarget (e.g. focus on a non-capturable window) can never leave us
+    // with no capture. Returns whether the new session was built. Feeder thread only.
+    private bool TryBuild(IntPtr handle, bool isWindow)
     {
-        var interop = GraphicsCaptureItem.As<IGraphicsCaptureItemInterop>();
-        Guid iid = GraphicsCaptureItemIid;
-        IntPtr itemAbi = isWindow ? interop.CreateForWindow(handle, ref iid) : interop.CreateForMonitor(handle, ref iid);
-        _item = MarshalInspectable<GraphicsCaptureItem>.FromAbi(itemAbi);
-        Marshal.Release(itemAbi);
-
-        _poolSize = _item.Size;
-        _framePool = Direct3D11CaptureFramePool.CreateFreeThreaded(_winrtDevice, PoolFormat, PoolBuffers, _poolSize);
-        _session = _framePool.CreateCaptureSession(_item);
-
+        GraphicsCaptureItem? item = null;
+        Direct3D11CaptureFramePool? pool = null;
+        GraphicsCaptureSession? session = null;
         try
         {
-            if (ApiInformation.IsApiContractPresent("Windows.Foundation.UniversalApiContract", 12) &&
-                ApiInformation.IsPropertyPresent("Windows.Graphics.Capture.GraphicsCaptureSession", "IsBorderRequired"))
-                _session.IsBorderRequired = false;
-        }
-        catch { /* Win10: border unavoidable */ }
-        try
-        {
-            if (ApiInformation.IsPropertyPresent("Windows.Graphics.Capture.GraphicsCaptureSession", "IsCursorCaptureEnabled"))
-                _session.IsCursorCaptureEnabled = _captureCursor;
-        }
-        catch { }
+            var interop = GraphicsCaptureItem.As<IGraphicsCaptureItemInterop>();
+            Guid iid = GraphicsCaptureItemIid;
+            IntPtr itemAbi = isWindow ? interop.CreateForWindow(handle, ref iid) : interop.CreateForMonitor(handle, ref iid);
+            item = MarshalInspectable<GraphicsCaptureItem>.FromAbi(itemAbi);
+            Marshal.Release(itemAbi);
 
-        _session.StartCapture();
+            var size = item.Size;
+            pool = Direct3D11CaptureFramePool.CreateFreeThreaded(_winrtDevice, PoolFormat, PoolBuffers, size);
+            session = pool.CreateCaptureSession(item);
+            try { if (ApiInformation.IsApiContractPresent("Windows.Foundation.UniversalApiContract", 12) && ApiInformation.IsPropertyPresent("Windows.Graphics.Capture.GraphicsCaptureSession", "IsBorderRequired")) session.IsBorderRequired = false; } catch { }
+            try { if (ApiInformation.IsPropertyPresent("Windows.Graphics.Capture.GraphicsCaptureSession", "IsCursorCaptureEnabled")) session.IsCursorCaptureEnabled = _captureCursor; } catch { }
+            session.StartCapture();
+
+            var oldSession = _session; var oldPool = _framePool;
+            _item = item; _framePool = pool; _session = session;
+            _poolSize = size; _curHwnd = handle; _curIsWindowTarget = isWindow;
+            try { oldSession?.Dispose(); } catch { }
+            try { oldPool?.Dispose(); } catch { }
+            return true;
+        }
+        catch
+        {
+            try { session?.Dispose(); } catch { }
+            try { pool?.Dispose(); } catch { }
+            return false;
+        }
     }
 
-    // Follow-active: if focus moved to a different real window (not ours), rebuild the session for it. The old
-    // _latest frame is kept until the new window delivers, so the stream frame-repeats rather than blanking.
-    private void MaybeRetargetForeground()
+    // The thing to capture in follow-active mode: the focused normal (non-ours) app window — else the primary
+    // monitor (full screen), so "no active window" (desktop focused / last window closed) records the whole
+    // screen instead of failing.
+    private (IntPtr handle, bool isWindow) ResolveFollowTarget()
     {
         var fg = WindowEnumerator.Foreground();
-        if (fg == _curHwnd || fg == IntPtr.Zero) return;
-        if (!WindowEnumerator.IsValid(fg) || WindowEnumerator.ProcessIdOf(fg) == _selfPid) return;
-        try { _session?.Dispose(); } catch { }
-        try { _framePool?.Dispose(); } catch { }
-        _item = null;
-        try { BuildSession(fg, isWindow: true); _curHwnd = fg; } catch { }
+        return WindowEnumerator.IsFollowable(fg, _selfPid) ? (fg, true) : (_fallbackMonitor, false);
+    }
+
+    // Follow-active: rebuild the session whenever the target changes (window <-> another window <-> full-screen
+    // fallback). Atomic + failure-safe; the old _latest frame is kept until the new target delivers a frame, so
+    // the stream frame-repeats rather than blanking.
+    private void MaybeRetargetForeground()
+    {
+        var (handle, isWindow) = ResolveFollowTarget();
+        if (handle == _curHwnd && isWindow == _curIsWindowTarget) return;
+        TryBuild(handle, isWindow); // on failure the current session keeps running
     }
 
     /// <summary>Polls the capture pool (on the calling thread) until the first frame lands.</summary>
@@ -150,14 +175,16 @@ public sealed class GpuWgcCapture : IDisposable
     public bool PullLatest()
     {
         if (_disposed) return false;
-        if (_followActive) MaybeRetargetForeground();
+        if (_followActive) { try { MaybeRetargetForeground(); } catch { } }
+        try
+        {
         Direct3D11CaptureFrame? latest = null, f;
         while ((f = _framePool.TryGetNextFrame()) != null) { latest?.Dispose(); latest = f; }
         if (latest is null) return false;
 
         // A captured WINDOW changes size when the user resizes/maximizes it; the frame pool must be Recreated to
         // the new content size or frames come back clipped/letterboxed in the old buffer. (Monitors never resize.)
-        if (_isWindow)
+        if (_curIsWindowTarget)
         {
             var cs = latest.ContentSize;
             if (cs.Width > 0 && cs.Height > 0 && (cs.Width != _poolSize.Width || cs.Height != _poolSize.Height))
@@ -199,6 +226,9 @@ public sealed class GpuWgcCapture : IDisposable
         }
         Interlocked.Increment(ref _arrivedCount);
         return true;
+        }
+        catch { return false; } // a capture hiccup (a window closing mid-pull, a transient WGC fault) must
+                                // never throw out of the feeder, which would stop the whole buffer
     }
 
     private ID3D11Texture2D GetTexture(IDirect3DSurface surface)

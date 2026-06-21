@@ -45,6 +45,19 @@ public static class WindowEnumerator
 
     public static uint ProcessIdOf(IntPtr hwnd) { GetWindowThreadProcessId(hwnd, out uint pid); return pid; }
 
+    /// <summary>Whether a window is a normal, user-facing app window worth following in active-window mode.
+    /// Excludes our own windows, the desktop/shell, invisible/minimized/cloaked/tool/titleless windows — so
+    /// "no active window" (desktop focused, last app closed) returns false and the caller falls back to full screen.</summary>
+    public static bool IsFollowable(IntPtr hwnd, uint selfPid)
+    {
+        if (hwnd == IntPtr.Zero || hwnd == GetShellWindow()) return false;
+        if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
+        if (ProcessIdOf(hwnd) == selfPid) return false;
+        if ((GetWindowLong(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) return false;
+        if (DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, out int cloaked, sizeof(int)) == 0 && cloaked != 0) return false;
+        return !string.IsNullOrWhiteSpace(TitleOf(hwnd));
+    }
+
     public static string TitleOf(IntPtr hwnd)
     {
         int len = GetWindowTextLength(hwnd);
