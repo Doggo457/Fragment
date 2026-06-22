@@ -33,6 +33,9 @@ public sealed class EditorSegment
 public enum EditorOutputFormat
 {
     Mp4,
+    Mov,
+    Mkv,
+    Webm,
     Gif
 }
 

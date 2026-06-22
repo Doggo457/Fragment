@@ -123,6 +123,10 @@ public partial class EditorWindow : Window
         _primaryW = _primaryH = 0;
         _loadedSource = null;
         try { Media.Stop(); Media.Close(); } catch { }
+        // Start a fresh clip un-rotated: a manual rotation left over from a previous clip would otherwise
+        // silently rotate this one on export (the bug behind "export came out sideways but preview looked
+        // right"). Setting the box fires OnRotateChanged → resets the preview transform too.
+        if (RotateBox != null) RotateBox.SelectedIndex = 0;
         InputBox.Text = path;
         StatusText.Text = "Loading…";
         ProbeAndAdd(path, makePrimary: true);
@@ -204,6 +208,9 @@ public partial class EditorWindow : Window
         PreviewHint.Visibility = Visibility.Collapsed;
         PlayButton.IsEnabled = true;
         PlayButton.Content = "▶ Play";
+        // Re-apply the manual-rotation transform to the freshly opened clip so the preview always shows the
+        // exact orientation that will be exported (otherwise a non-None Rotate could go unreflected here).
+        UpdatePreviewRotation();
         UpdatePlayhead();
     }
 
@@ -454,11 +461,30 @@ public partial class EditorWindow : Window
     private void OnFormatChanged(object sender, SelectionChangedEventArgs e)
     {
         if (!IsLoaded) return;
-        bool gif = FormatBox.SelectedIndex == 1;
-        AudioPanel.IsEnabled = !gif;
+        var fmt = SelectedFormat();
+        bool gif = fmt == EditorOutputFormat.Gif;
+        AudioPanel.IsEnabled = !gif;            // every video container keeps audio; GIF can't
         SizePanel.IsEnabled = !gif;
-        FastCopyCheck.IsEnabled = !gif;
+        FastCopyCheck.IsEnabled = fmt == EditorOutputFormat.Mp4;   // stream-copy cut is MP4-only
     }
+
+    private EditorOutputFormat SelectedFormat() => FormatBox.SelectedIndex switch
+    {
+        1 => EditorOutputFormat.Mov,
+        2 => EditorOutputFormat.Mkv,
+        3 => EditorOutputFormat.Webm,
+        4 => EditorOutputFormat.Gif,
+        _ => EditorOutputFormat.Mp4,
+    };
+
+    private static string ExtFor(EditorOutputFormat f) => f switch
+    {
+        EditorOutputFormat.Mov => ".mov",
+        EditorOutputFormat.Mkv => ".mkv",
+        EditorOutputFormat.Webm => ".webm",
+        EditorOutputFormat.Gif => ".gif",
+        _ => ".mp4",
+    };
 
     private void OnAudioChanged(object sender, SelectionChangedEventArgs e)
     {
@@ -470,7 +496,7 @@ public partial class EditorWindow : Window
     {
         var o = new ExportOptions
         {
-            Format = FormatBox.SelectedIndex == 1 ? EditorOutputFormat.Gif : EditorOutputFormat.Mp4,
+            Format = SelectedFormat(),
             OutFps = 60,
             GifFps = 15,
             FastCopy = FastCopyCheck.IsChecked == true,
@@ -515,7 +541,7 @@ public partial class EditorWindow : Window
             PlayButton.Content = "▶ Play";
 
             var opts = BuildOptions();
-            string outPath = BuildOutputPath(opts.Format == EditorOutputFormat.Gif ? ".gif" : ".mp4");
+            string outPath = BuildOutputPath(ExtFor(opts.Format));
             var snapshot = _segments.Select(s => s.Clone()).ToList();
 
             string phase = "Rendering…";

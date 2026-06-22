@@ -124,8 +124,12 @@
                 <WrapPanel Orientation="Horizontal">
                     <StackPanel Orientation="Horizontal" Margin="0,4,18,4">
                         <TextBlock Style="{StaticResource LabelText}" Text="Format"/>
-                        <ComboBox x:Name="FormatBox" Width="90" SelectedIndex="0" SelectionChanged="OnFormatChanged">
+                        <ComboBox x:Name="FormatBox" Width="90" SelectedIndex="0" SelectionChanged="OnFormatChanged"
+                                  ToolTip="MP4/MOV/MKV use H.264. WEBM uses VP9 (smaller, but slower to encode). GIF is silent.">
                             <ComboBoxItem Content="MP4"/>
+                            <ComboBoxItem Content="MOV"/>
+                            <ComboBoxItem Content="MKV"/>
+                            <ComboBoxItem Content="WEBM"/>
                             <ComboBoxItem Content="GIF"/>
                         </ComboBox>
                     </StackPanel>

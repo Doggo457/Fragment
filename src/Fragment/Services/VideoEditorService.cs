@@ -385,29 +385,38 @@ public sealed class VideoEditorService
             sb.Append("-map ").Append(Quote(aLabel)).Append(' ');
         }
 
-        // Video codec / rate control.
-        sb.Append("-c:v libx264 -preset veryfast -pix_fmt yuv420p ");
+        // Video codec / rate control. MP4/MOV/MKV all carry H.264+AAC (same encode, the muxer is chosen
+        // from the output extension); WEBM can't hold those, so it gets VP9+Opus instead.
+        bool webm = o.Format == EditorOutputFormat.Webm;
+        sb.Append(webm ? "-c:v libvpx-vp9 -row-mt 1 -pix_fmt yuv420p " : "-c:v libx264 -preset veryfast -pix_fmt yuv420p ");
         if (o.TargetSizeMb is { } mb && mb > 0)
         {
             double totalSec = 0;
             foreach (var s in segments) totalSec += s.Duration;
             int audioKbps = wantAudio ? 160 : 0;
             // bitrate(kbps) = size(bits) / duration(s) / 1000, minus the audio budget. The 0.95 factor
-            // leaves headroom for MP4 container overhead so the file lands at/under the target.
+            // leaves headroom for container overhead so the file lands at/under the target.
             int vKbps = (int)Math.Max(200, (mb * 0.95 * 8.0 * 1024.0) / Math.Max(0.5, totalSec) - audioKbps);
             string k = vKbps.ToString(inv);
-            sb.Append("-b:v ").Append(k).Append("k -maxrate ").Append(k).Append("k -bufsize ")
-              .Append((vKbps * 2).ToString(inv)).Append("k ");
+            if (webm)
+                sb.Append("-b:v ").Append(k).Append("k ");   // VP9 hits the target from -b:v alone
+            else
+                sb.Append("-b:v ").Append(k).Append("k -maxrate ").Append(k).Append("k -bufsize ")
+                  .Append((vKbps * 2).ToString(inv)).Append("k ");
         }
         else
         {
-            sb.Append("-crf 20 ");
+            // Constant-quality. VP9's CRF scale differs from x264's and requires -b:v 0 to engage.
+            sb.Append(webm ? "-crf 32 -b:v 0 " : "-crf 20 ");
         }
 
-        if (wantAudio) sb.Append("-c:a aac -b:a 160k ");
+        if (wantAudio) sb.Append(webm ? "-c:a libopus -b:a 160k " : "-c:a aac -b:a 160k ");
         else sb.Append("-an ");
 
-        sb.Append("-movflags +faststart ").Append(Quote(outputPath));
+        // +faststart relocates the moov atom for streaming; only MP4/MOV use it. MKV/WEBM ignore it.
+        if (o.Format is EditorOutputFormat.Mp4 or EditorOutputFormat.Mov)
+            sb.Append("-movflags +faststart ");
+        sb.Append(Quote(outputPath));
         return sb.ToString();
     }
 
