@@ -129,51 +129,28 @@ public partial class EditorWindow : Window
     }
 
     /// <summary>Reads duration/size with a lightweight off-screen MediaPlayer, then appends a segment.</summary>
-    private void ProbeAndAdd(string path, bool makePrimary)
+    private async void ProbeAndAdd(string path, bool makePrimary)
     {
-        var probe = new MediaPlayer();
-        _probes.Add(probe); // keep it alive until MediaOpened/MediaFailed fires
-
-        void Cleanup()
+        // Probe via FFMPEG (not WPF MediaPlayer): ffmpeg reads any format it supports (.mov/.mkv/.webm/HEVC/…),
+        // gives the rotation-correct display size for the canvas, and the duration — so the clip loads even when
+        // Windows lacks a codec to PREVIEW it. The preview (loaded by SelectSegment below) is best-effort; if it
+        // can't play the format the clip is still added and exports fine.
+        StatusText.Text = "Reading video…";
+        var info = await System.Threading.Tasks.Task.Run(() => _editor.ProbeInfo(path));
+        if (info is not { } x || x.DurationSec <= 0.01)
         {
-            probe.MediaOpened -= OnOpened;
-            probe.MediaFailed -= OnFailed;
-            _probes.Remove(probe);
-            try { probe.Close(); } catch { } // release native media resources on every path
+            StatusText.Text = "Couldn't read that video file (unsupported or corrupt).";
+            return;
         }
 
-        void OnOpened(object? s, EventArgs e)
-        {
-            double dur = probe.NaturalDuration.HasTimeSpan ? probe.NaturalDuration.TimeSpan.TotalSeconds : 0;
-            int vw = probe.NaturalVideoWidth, vh = probe.NaturalVideoHeight;
-            Cleanup();
+        if (makePrimary && _primaryW <= 0 && x.Width > 0) { _primaryW = x.Width; _primaryH = x.Height; }
 
-            if (dur <= 0) { StatusText.Text = "Couldn't read that file's length."; return; }
-            if (makePrimary && _primaryW <= 0)
-            {
-                // Use ffmpeg's rotation-aware DISPLAY size for the export canvas, not WPF's coded size — else a
-                // phone video (coded landscape + 90° flag, auto-rotated to portrait on export) gets black bars.
-                var disp = _editor.ProbeDisplaySize(path);
-                if (disp is { } d && d.Width > 0) { _primaryW = d.Width; _primaryH = d.Height; }
-                else if (vw > 0) { _primaryW = vw; _primaryH = vh; }
-            }
-
-            _segments.Add(new EditorSegment(path, 0, dur));
-            UpdateTotals();
-            SelectSegment(_segments.Count - 1);
-            StatusText.Text = makePrimary ? "Loaded — cut with Split/Delete, add clips to merge, then Export." : "Clip added.";
-        }
-
-        void OnFailed(object? s, ExceptionEventArgs e)
-        {
-            Cleanup();
-            StatusText.Text = "Couldn't open that file (codec not supported by Windows).";
-        }
-
-        probe.MediaOpened += OnOpened;
-        probe.MediaFailed += OnFailed;
-        try { probe.Open(new Uri(path)); }
-        catch (Exception ex) { Cleanup(); StatusText.Text = $"Open failed: {ex.Message}"; }
+        _segments.Add(new EditorSegment(path, 0, x.DurationSec));
+        UpdateTotals();
+        SelectSegment(_segments.Count - 1); // loads the preview (WPF, best-effort)
+        StatusText.Text = makePrimary
+            ? "Loaded — cut with Split/Delete, add clips to merge, then Export."
+            : "Clip added.";
     }
 
     // ------------------------------------------------------------- preview
@@ -575,6 +552,25 @@ public partial class EditorWindow : Window
     }
 
     private void UpdateExportEnabled() => ExportButton.IsEnabled = !_busy && _segments.Count > 0;
+
+    // Rotate the preview to match the selected manual rotation, so the user sees what they'll get on export.
+    private void OnRotateChanged(object sender, SelectionChangedEventArgs e) => UpdatePreviewRotation();
+    private void OnPreviewSizeChanged(object sender, SizeChangedEventArgs e) => UpdatePreviewRotation();
+
+    private void UpdatePreviewRotation()
+    {
+        if (Media is null || RotateBox is null) return;
+        int angle = RotateBox.SelectedIndex switch { 1 => 90, 2 => 180, 3 => 270, _ => 0 };
+        if (angle == 0) { Media.RenderTransform = Transform.Identity; return; }
+
+        // For a quarter-turn the element becomes H×W; scale it down to fit its original W×H slot (no clipping).
+        double w = Media.ActualWidth, h = Media.ActualHeight;
+        double scale = (angle == 90 || angle == 270) && w > 0 && h > 0 ? Math.Min(w, h) / Math.Max(w, h) : 1.0;
+        var g = new TransformGroup();
+        g.Children.Add(new ScaleTransform(scale, scale));
+        g.Children.Add(new RotateTransform(angle));
+        Media.RenderTransform = g;
+    }
 
     private void OnCloseClick(object sender, RoutedEventArgs e) => Close();
 

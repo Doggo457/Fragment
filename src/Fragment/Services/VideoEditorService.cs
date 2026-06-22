@@ -33,36 +33,57 @@ public sealed class VideoEditorService
     /// the auto-rotated portrait frame got huge pillarbox bars. Returns the size the exported frame will
     /// actually have so the canvas matches and there are no bars. Null if it can't be read.
     /// </summary>
-    public (int Width, int Height)? ProbeDisplaySize(string file)
+    /// <summary>
+    /// Probes a video's DISPLAY size (rotation applied) AND duration via ffmpeg — so the editor can read ANY
+    /// format ffmpeg supports (.mov/.mkv/.webm/HEVC/etc.), not just what WPF MediaPlayer has codecs for. Decodes
+    /// one frame (ffmpeg applies rotation metadata in any format) for the true size, and parses the Duration line.
+    /// </summary>
+    public (int Width, int Height, double DurationSec)? ProbeInfo(string file)
     {
         if (string.IsNullOrWhiteSpace(file) || !File.Exists(file)) return null;
-        // Decode ONE frame through ffmpeg's simple path, which APPLIES the rotation metadata regardless of how
-        // it's encoded (Display Matrix, legacy rotate tag, etc.). The decoded frame's size IS the true display
-        // size — far more robust than parsing rotation strings ourselves (which missed some phone formats).
         string tmp = Path.Combine(Path.GetTempPath(), "Fragment", "probe_" + Guid.NewGuid().ToString("N") + ".png");
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(tmp)!);
+            // No -loglevel error: we want ffmpeg's "Duration:" line on stderr. -hide_banner trims the noise.
             var psi = new ProcessStartInfo(_ffmpegPath,
-                "-hide_banner -loglevel error -y -i " + Quote(file) + " -frames:v 1 " + Quote(tmp))
+                "-hide_banner -y -i " + Quote(file) + " -frames:v 1 " + Quote(tmp))
             {
                 RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true,
             };
+            string err;
             using (var p = Process.Start(psi))
             {
                 if (p is null) return null;
-                p.StandardError.ReadToEnd();
-                if (!p.WaitForExit(8000)) { try { p.Kill(true); } catch { } return null; }
+                err = p.StandardError.ReadToEnd();
+                if (!p.WaitForExit(10000)) { try { p.Kill(true); } catch { } return null; }
             }
-            if (!File.Exists(tmp)) return null;
 
-            // PNG header: 8-byte signature + chunk-length(4) + "IHDR"(4) + width(4 BE) + height(4 BE).
-            var hdr = new byte[24];
-            using (var fs = File.OpenRead(tmp))
-                if (fs.Read(hdr, 0, 24) < 24) return null;
-            int w = (hdr[16] << 24) | (hdr[17] << 16) | (hdr[18] << 8) | hdr[19];
-            int h = (hdr[20] << 24) | (hdr[21] << 16) | (hdr[22] << 8) | hdr[23];
-            return (w > 0 && h > 0) ? (w, h) : null;
+            // Display size from the decoded frame's PNG header (8-byte sig + len(4)+"IHDR"(4)+width(4 BE)+height(4 BE)).
+            int w = 0, h = 0;
+            if (File.Exists(tmp))
+            {
+                var hdr = new byte[24];
+                using var fs = File.OpenRead(tmp);
+                if (fs.Read(hdr, 0, 24) >= 24)
+                {
+                    w = (hdr[16] << 24) | (hdr[17] << 16) | (hdr[18] << 8) | hdr[19];
+                    h = (hdr[20] << 24) | (hdr[21] << 16) | (hdr[22] << 8) | hdr[23];
+                }
+            }
+            if (w <= 0 || h <= 0) return null;
+
+            // Duration from ffmpeg's "Duration: HH:MM:SS.ss," line.
+            double dur = 0;
+            int di = err.IndexOf("Duration:", StringComparison.Ordinal);
+            if (di >= 0)
+            {
+                string ds = err.Substring(di + "Duration:".Length).TrimStart();
+                int comma = ds.IndexOf(',');
+                if (comma > 0) ds = ds.Substring(0, comma).Trim();
+                if (TimeSpan.TryParse(ds, CultureInfo.InvariantCulture, out var ts)) dur = ts.TotalSeconds;
+            }
+            return (w, h, dur);
         }
         catch { return null; }
         finally { try { if (File.Exists(tmp)) File.Delete(tmp); } catch { } }
